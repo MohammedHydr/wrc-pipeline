@@ -1,0 +1,51 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+scraper/httpcache/
+.pytest_cache/
+airflow_home/
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# uv virtual environment
+.venv/
+
+# Local data and storage
+data/
+storage/
+downloads/
+mongo-data/
+minio-data/
+
+# Logs
+*.log
+logs/
+
+# Playwright
+playwright-report/
+test-results/
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude local/private configuration
+.claude/settings.local.json
+.claude/
+CLAUDE.md
