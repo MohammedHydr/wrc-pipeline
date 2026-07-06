@@ -5,7 +5,7 @@ from datetime import date
 
 from scrapy.http import HtmlResponse, Request
 
-from wrc_scraper.spiders.wrc_spider import WrcSpider
+from scraper.wrc_scraper.spiders import WrcSpider
 
 # Two result cards + the count line, mirroring the exact live markup observed
 # via `scrapy shell` (li.each-item / span.refNO / h2.title a / span.date /

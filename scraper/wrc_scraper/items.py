@@ -22,7 +22,9 @@ class WrcDocumentItem(scrapy.Item):
     content_type = scrapy.Field()  # response Content-Type header
 
     # --- computed in pipelines -----------------------------------------------
-    file_hash = scrapy.Field()  # sha256 hex digest of file_content
+    file_hash = scrapy.Field()  # SHA-256 of the exact downloaded bytes
+    content_hash = scrapy.Field()  # SHA-256 of stable document content
     file_path = scrapy.Field()  # s3://bucket/key of the stored object
     size_bytes = scrapy.Field()  # exact byte size of the stored file
     unchanged = scrapy.Field()  # bool: True if hash matched previous run
+    known_version = scrapy.Field()  # bool: content matches an OLDER stored version

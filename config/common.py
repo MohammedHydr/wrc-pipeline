@@ -18,8 +18,7 @@ from typing import Iterator, Optional, Tuple
 import boto3
 from botocore.config import Config as BotoConfig
 from pymongo import MongoClient
-from pythonjsonlogger import jsonlogger
-
+from pythonjsonlogger import json as jsonlogger
 from config.settings import Settings
 
 

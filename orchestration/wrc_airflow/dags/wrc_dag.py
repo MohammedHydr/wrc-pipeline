@@ -31,6 +31,7 @@ Then open http://localhost:8080, find the `wrc_pipeline` DAG, click
         "run_end_date":   "2024-03-31"
     }
 """
+
 from __future__ import annotations
 
 import os
@@ -42,6 +43,7 @@ from airflow import DAG
 from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
+from dotenv import dotenv_values
 
 # Path of this file: <REPO_ROOT>/orchestration/wrc_airflow/dags/wrc_dag.py
 # parents[0]=dags  parents[1]=wrc_airflow  parents[2]=orchestration  parents[3]=REPO_ROOT
@@ -50,25 +52,29 @@ SCRAPER_DIR = REPO_ROOT / "scraper"
 
 _ENV_FILE = REPO_ROOT / ".env"
 
+
 # Merge .env values into the subprocess environment (pydantic-settings honours
 # env-var precedence, so real env vars still win over the file values).
+#
+# IMPORTANT: parse with python-dotenv — the same parser pydantic-settings uses
+# for the CLI path — so quoting/escaping behaves identically in both launch
+# methods. A naive line-split would keep surrounding quotes (e.g. a quoted
+# HTML_CONTENT_SELECTORS), silently changing selector behaviour and therefore
+# content hashes depending on how the pipeline was launched.
 def _build_env() -> dict[str, str]:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(REPO_ROOT)
     if _ENV_FILE.exists():
-        for line in _ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            env.setdefault(key.strip(), val.strip())
+        for key, val in dotenv_values(_ENV_FILE).items():
+            if val is not None:
+                env.setdefault(key, val)
     return env
 
 
 with DAG(
     dag_id="wrc_pipeline",
     description="Scrape WRC decisions into the landing zone, then transform to the curated zone.",
-    schedule=None,       # manual / API trigger only — no automatic scheduling
+    schedule=None,  # manual / API trigger only — no automatic scheduling
     start_date=datetime(2024, 1, 1),
     catchup=False,
     tags=["wrc", "legal", "scraping"],
@@ -92,7 +98,6 @@ with DAG(
         ),
     },
 ) as dag:
-
     # ---------------------------------------------------------------------- #
     # Task 1: scrape the landing zone
     # ---------------------------------------------------------------------- #
@@ -109,8 +114,9 @@ with DAG(
         env=_build_env(),
         doc_md=(
             "Run the Scrapy WRC spider for the configured date range. "
-            "Writes raw document files to MinIO (landing bucket) and upserts "
-            "metadata into MongoDB (landing_documents collection)."
+            "Writes raw document files to MinIO (landing bucket), inserts "
+            "immutable versions into MongoDB (landing_document_versions) and "
+            "updates the latest-version pointers (document_state)."
         ),
     )
 
@@ -122,6 +128,7 @@ with DAG(
         params = context["params"]
         sys.path.insert(0, str(REPO_ROOT))
         from transform.transform import run_transformation  # noqa: PLC0415
+
         stats = run_transformation(
             params["run_start_date"],
             params["run_end_date"],

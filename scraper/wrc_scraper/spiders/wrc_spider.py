@@ -40,6 +40,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import scrapy
+from itemadapter import ItemAdapter
+from scrapy import signals
 from scrapy.http import Response
 
 from config.common import (
@@ -98,12 +100,23 @@ class WrcSpider(scrapy.Spider):
         )
 
         # run statistics keyed by (partition_label, body). "scraped" counts
-        # successfully downloaded documents; "unchanged" (incremented by the
-        # dedup pipeline) is the subset of those whose hash matched a previous
-        # run, so every discovered record ends in exactly one auditable state:
+        # documents that were FULLY PERSISTED (hashed, stored, metadata
+        # written) — incremented by MongoMetadataPipeline, not at download
+        # time, so a failure in any pipeline stage is never counted as a
+        # success. "unchanged" is the subset of scraped whose content hash
+        # matched a previous run. Item failures at any stage (download,
+        # canonicalization, storage, metadata) are appended to "failed", so
+        # every discovered record ends in exactly one auditable state:
         # found == scraped(succeeded, incl. unchanged) + failed.
         self.run_stats: Dict[Tuple[str, str], Dict] = defaultdict(
-            lambda: {"found": None, "scraped": 0, "unchanged": 0, "failed": []}
+            lambda: {
+                "found": None,
+                "scraped": 0,
+                "unchanged": 0,
+                "failed": [],
+                "listing_failures": [],
+                "count_parse_failed": False,
+            }
         )
         # (source, body, identifier) -> file_hash, for fast-mode skip
         self.known_hashes: Dict[Tuple[str, str, str], str] = {}
@@ -112,6 +125,16 @@ class WrcSpider(scrapy.Spider):
     def from_crawler(cls, crawler, *args, **kwargs):
         spider = super().from_crawler(crawler, *args, **kwargs)
         spider._load_known_hashes()
+
+        crawler.signals.connect(
+            spider._on_item_error,
+            signal=signals.item_error,
+        )
+        crawler.signals.connect(
+            spider._on_item_dropped,
+            signal=signals.item_dropped,
+        )
+
         return spider
 
     def _load_known_hashes(self) -> None:
@@ -142,7 +165,7 @@ class WrcSpider(scrapy.Spider):
     # ------------------------------------------------------------------ #
     # Step 1: fan out (body x partition) page-1 search requests
     # ------------------------------------------------------------------ #
-    def start_requests(self) -> Iterable[scrapy.Request]:
+    async def start(self) -> Iterable[scrapy.Request]:
         for body in self.bodies:
             code = self.body_codes.get(body)
             if code is None:
@@ -199,7 +222,20 @@ class WrcSpider(scrapy.Spider):
 
         if meta["page"] == 1:
             total = self._extract_total(response)
-            self.run_stats[key]["found"] = total
+            if total is None:
+                self.run_stats[key]["count_parse_failed"] = True
+
+                self.logger.error(
+                    "could not parse total result count",
+                    extra={
+                        "partition": meta["partition_label"],
+                        "body": meta["body"],
+                        "url": response.url,
+                        "page": 1,
+                    },
+                )
+            else:
+                self.run_stats[key]["found"] = total
             self.logger.info(
                 "search results",
                 extra={
@@ -329,8 +365,9 @@ class WrcSpider(scrapy.Spider):
         item["file_ext"] = ext
         item["content_type"] = content_type
 
-        key = (item["partition_label"], item["body"])
-        self.run_stats[key]["scraped"] += 1
+        # NOTE: "scraped" is NOT incremented here. Success is counted by
+        # MongoMetadataPipeline once the document is fully persisted, so a
+        # failure in hashing/storage/metadata never masquerades as a success.
         yield item
 
     # ------------------------------------------------------------------ #
@@ -354,18 +391,228 @@ class WrcSpider(scrapy.Spider):
         )
 
     def on_request_failed(self, failure):
+        request = failure.request
+        meta = request.meta
+
+        status = getattr(
+            getattr(failure.value, "response", None),
+            "status",
+            None,
+        )
+
+        key = (
+            meta.get("partition_label", "?"),
+            meta.get("body", "?"),
+        )
+
+        page = int(meta.get("page") or 1)
+        found = self.run_stats[key]["found"]
+
+        if page == 1:
+            # The total result count is unavailable.
+            records_at_risk = None
+        elif found is not None:
+            page_offset = (page - 1) * self.per_page
+            records_at_risk = min(
+                self.per_page,
+                max(found - page_offset, 0),
+            )
+        else:
+            records_at_risk = self.per_page
+
+        entry = {
+            "url": request.url,
+            "page": page,
+            "status": status,
+            "stage": "listing",
+            "error": failure.getErrorMessage(),
+            "records_at_risk": records_at_risk,
+        }
+
+        self.run_stats[key]["listing_failures"].append(entry)
+
         self.logger.error(
-            "request failed",
+            "listing-page request failed",
             extra={
-                "url": failure.request.url,
-                "error": failure.getErrorMessage(),
+                **entry,
+                "partition": key[0],
+                "body": key[1],
             },
         )
 
     # ------------------------------------------------------------------ #
+    # Pipeline-stage failure accounting (item_error / item_dropped)
+    # ------------------------------------------------------------------ #
+    def _on_item_error(self, item, response, spider, failure):
+        """A pipeline raised while processing an item."""
+        self._record_item_failure(item, error=repr(failure.value))
+
+    def _on_item_dropped(self, item, response, exception, spider):
+        """A pipeline dropped an item via DropItem."""
+        self._record_item_failure(item, error=str(exception))
+
+    def _record_item_failure(self, item, error: str) -> None:
+        adapter = ItemAdapter(item)
+        key = (
+            adapter.get("partition_label") or "?",
+            adapter.get("body") or "?",
+        )
+        entry = {
+            "url": adapter.get("doc_url"),
+            "identifier": adapter.get("identifier"),
+            "error": error,
+            "status": None,
+            "stage": "pipeline",
+        }
+        self.run_stats[key]["failed"].append(entry)
+        self.logger.error(
+            "item processing failed",
+            extra={**entry, "partition": key[0], "body": key[1]},
+        )
+    def _item_failure_context(self, item):
+        adapter = ItemAdapter(item)
+
+        key = (
+            adapter.get("partition_label") or "?",
+            adapter.get("body") or "?",
+        )
+
+        return adapter, key
+
+
+    def _on_item_error(
+        self,
+        item,
+        response,
+        spider,
+        failure,
+    ) -> None:
+        """Record exceptions raised by hashing, storage, or metadata pipelines."""
+
+        adapter, key = self._item_failure_context(item)
+
+        error_type = (
+            failure.type.__name__
+            if getattr(failure, "type", None)
+            else type(failure.value).__name__
+        )
+
+        entry = {
+            "identifier": adapter.get("identifier"),
+            "url": (
+                adapter.get("doc_url")
+                or getattr(response, "url", None)
+            ),
+            "status": getattr(response, "status", None),
+            "stage": "pipeline",
+            "error_type": error_type,
+            "error": failure.getErrorMessage(),
+        }
+
+        self.run_stats[key]["failed"].append(entry)
+
+        self.logger.error(
+            "item pipeline failed",
+            extra={
+                **entry,
+                "partition": key[0],
+                "body": key[1],
+            },
+        )
+
+
+    def _on_item_dropped(
+        self,
+        item,
+        response,
+        exception,
+        spider,
+    ) -> None:
+        """Record items intentionally dropped by a pipeline."""
+
+        adapter, key = self._item_failure_context(item)
+
+        entry = {
+            "identifier": adapter.get("identifier"),
+            "url": (
+                adapter.get("doc_url")
+                or getattr(response, "url", None)
+            ),
+            "status": getattr(response, "status", None),
+            "stage": "pipeline",
+            "error_type": type(exception).__name__,
+            "error": str(exception),
+        }
+
+        self.run_stats[key]["failed"].append(entry)
+
+        self.logger.error(
+            "item dropped by pipeline",
+            extra={
+                **entry,
+                "partition": key[0],
+                "body": key[1],
+            },
+        )
+    # ------------------------------------------------------------------ #
     # Step 4: end-of-run summary
     # ------------------------------------------------------------------ #
-    def closed(self, reason: str):
+    def closed(self, reason: str) -> None:
+        """Build, log, and persist the final run summary."""
+
+        partition_summaries = []
+
+        for (partition, body), stats in sorted(self.run_stats.items()):
+            document_failures = stats["failed"]
+            listing_failures = stats["listing_failures"]
+
+            known_listing_losses = sum(
+                failure.get("records_at_risk") or 0
+                for failure in listing_failures
+            )
+
+            unknown_listing_loss = any(
+                failure.get("records_at_risk") is None
+                for failure in listing_failures
+            )
+
+            accounted_records = (
+                stats["scraped"]
+                + len(document_failures)
+                + known_listing_losses
+            )
+
+            reconciled = (
+                stats["found"] is not None
+                and not unknown_listing_loss
+                and accounted_records == stats["found"]
+            )
+
+            complete = (
+                reconciled
+                and not document_failures
+                and not listing_failures
+                and not stats["count_parse_failed"]
+            )
+
+            partition_summaries.append(
+                {
+                    "partition": partition,
+                    "body": body,
+                    "records_found": stats["found"],
+                    "records_scraped": stats["scraped"],
+                    "records_unchanged": stats["unchanged"],
+                    "records_failed": len(document_failures),
+                    "failures": document_failures,
+                    "listing_failures": listing_failures,
+                    "records_listing_at_risk": known_listing_losses,
+                    "count_parse_failed": stats["count_parse_failed"],
+                    "records_accounted": accounted_records,
+                    "reconciled": reconciled,
+                    "complete": complete,
+                }
+            )
+
         summary = {
             "spider": self.name,
             "run_id": self.run_id,
@@ -373,41 +620,75 @@ class WrcSpider(scrapy.Spider):
             "start_date": self.start_date.isoformat(),
             "end_date": self.end_date.isoformat(),
             "partition_size": self.partition_size,
-            "partitions": [
-                {
-                    "partition": p,
-                    "body": b,
-                    "records_found": s["found"],
-                    "records_scraped": s["scraped"],
-                    "records_unchanged": s["unchanged"],
-                    "records_failed": len(s["failed"]),
-                    "failures": s["failed"],
-                }
-                for (p, b), s in sorted(self.run_stats.items())
-            ],
+            "partitions": partition_summaries,
             "totals": {
-                "found": sum(s["found"] or 0 for s in self.run_stats.values()),
-                "scraped": sum(s["scraped"] for s in self.run_stats.values()),
-                "unchanged": sum(s["unchanged"] for s in self.run_stats.values()),
-                "failed": sum(len(s["failed"]) for s in self.run_stats.values()),
+                "found": sum(
+                    stats["found"] or 0
+                    for stats in self.run_stats.values()
+                ),
+                "scraped": sum(
+                    stats["scraped"]
+                    for stats in self.run_stats.values()
+                ),
+                "unchanged": sum(
+                    stats["unchanged"]
+                    for stats in self.run_stats.values()
+                ),
+                "failed": sum(
+                    len(stats["failed"])
+                    for stats in self.run_stats.values()
+                ),
+                "listing_failures": sum(
+                    len(stats["listing_failures"])
+                    for stats in self.run_stats.values()
+                ),
+                "records_listing_at_risk": sum(
+                    failure.get("records_at_risk") or 0
+                    for stats in self.run_stats.values()
+                    for failure in stats["listing_failures"]
+                ),
+                "reconciled_partitions": sum(
+                    1
+                    for partition_summary in partition_summaries
+                    if partition_summary["reconciled"]
+                ),
+                "complete_partitions": sum(
+                    1
+                    for partition_summary in partition_summaries
+                    if partition_summary["complete"]
+                ),
             },
             "finished_at": datetime.now(timezone.utc).isoformat(),
         }
-        self.logger.info("run summary", extra={"summary": summary})
+
+        self.logger.info(
+            "run summary",
+            extra={"summary": summary},
+        )
+
         try:
             client = get_mongo_client(self.cfg)
-            run_logs = client[self.cfg.mongo_db][self.cfg.mongo_run_log_collection]
-            # Indexes for the common observability queries: latest run, by id.
+
+            run_logs = client[
+                self.cfg.mongo_db
+            ][
+                self.cfg.mongo_run_log_collection
+            ]
+
             run_logs.create_index([("finished_at", -1)])
             run_logs.create_index([("run_id", 1)])
-            run_logs.insert_one(json.loads(json.dumps(summary)))
-            client.close()
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning(
-                "could not persist run summary", extra={"error": str(exc)}
+
+            run_logs.insert_one(
+                json.loads(json.dumps(summary))
             )
 
+            client.close()
 
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning(
+                "could not persist run summary",
+                extra={"error": str(exc)},
+            )
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #

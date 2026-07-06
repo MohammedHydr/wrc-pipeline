@@ -8,17 +8,20 @@ Nothing is hardcoded in application code — see `.env.example` for defaults.
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import List
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ENV_FILE = PROJECT_ROOT / ".env"
 
 class Settings(BaseSettings):
     """Typed, validated application settings."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -82,9 +85,10 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     # MongoDB (metadata store)
     # ------------------------------------------------------------------ #
-    mongo_uri: str = Field(default="mongodb://root:example@localhost:27017")
+    mongo_uri: str = Field(...)    
     mongo_db: str = Field(default="wrc")
-    mongo_landing_collection: str = Field(default="landing_documents")
+    mongo_landing_collection: str = Field(default="landing_document_versions")
+    mongo_state_collection: str = Field(default="document_state")
     mongo_curated_collection: str = Field(default="curated_documents")
     mongo_run_log_collection: str = Field(default="run_logs")
 
@@ -118,6 +122,17 @@ class Settings(BaseSettings):
     # is already installed as a Scrapy dependency; "html.parser" (pure-Python,
     # no extra dep) is a portable fallback if lxml is unavailable.
     html_parser: str = Field(default="lxml")
+    html_drop_selectors: str = Field(
+    default=(
+        ".cookie-banner,.cookie-consent,.cookies,"
+        ".breadcrumb,.breadcrumbs,"
+        ".social-share,.share-tools,"
+        ".document-actions,.page-actions,"
+        ".return-to-search,.print-controls"
+        )
+    )
+
+    html_min_text_chars: int = Field(default=200, ge=1)
 
     # Logging
     log_level: str = Field(default="INFO")
@@ -142,6 +157,14 @@ class Settings(BaseSettings):
     @property
     def html_selector_list(self) -> List[str]:
         return [s.strip() for s in self.html_content_selectors.split(",") if s.strip()]
+
+    @property
+    def html_drop_selector_list(self) -> List[str]:
+        return [
+            selector.strip()
+            for selector in self.html_drop_selectors.split(",")
+            if selector.strip()
+        ]
 
     @property
     def search_url(self) -> str:

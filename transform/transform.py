@@ -29,7 +29,6 @@ import argparse
 import logging
 from datetime import datetime, timezone
 
-from bs4 import BeautifulSoup, FeatureNotFound
 from pymongo import ASCENDING
 
 from config.common import (
@@ -43,6 +42,7 @@ from config.common import (
     slug,
 )
 from config.settings import get_settings
+from config.html_utils import canonicalize_html
 
 logger = logging.getLogger("transform")
 
@@ -64,60 +64,6 @@ PASSTHROUGH_EXTS = {"pdf", "doc", "docx", "rtf"}
 # parser version are re-transformed on the next run (landing stays untouched).
 PARSER_VERSION = "1.0"
 
-
-# --------------------------------------------------------------------------- #
-# HTML cleaning
-# --------------------------------------------------------------------------- #
-def extract_relevant_html(
-    raw: bytes, selectors: list[str], parser: str = "lxml"
-) -> bytes:
-    """Return a minimal HTML document containing only the decision content.
-
-    Strategy: try each configured CSS selector in order and take the first
-    match that contains a meaningful amount of text; fall back to <body> with
-    boilerplate tags stripped. Data-quality extras: collapse whitespace-only
-    nodes and drop tag attributes that only matter for styling/JS.
-
-    `parser` is the BeautifulSoup backend ("lxml" by default; "html.parser" is
-    a dependency-free fallback). We fall back to html.parser automatically if
-    the configured parser isn't installed, so the step never hard-fails on a
-    missing optional dependency.
-    """
-    try:
-        soup = BeautifulSoup(raw, parser)
-    except FeatureNotFound:
-        logger.warning(
-            "configured HTML parser unavailable; falling back",
-            extra={"requested_parser": parser, "fallback": "html.parser"},
-        )
-        soup = BeautifulSoup(raw, "html.parser")
-
-    for tag in soup(STRIP_TAGS):
-        tag.decompose()
-
-    node = None
-    for sel in selectors:
-        candidate = soup.select_one(sel)
-        if candidate and len(candidate.get_text(strip=True)) > 200:
-            node = candidate
-            break
-    if node is None:
-        node = soup.body or soup
-
-    # drop presentational / behavioural attributes for cleaner downstream text
-    for tag in [node, *node.find_all(True)]:
-        if hasattr(tag, "attrs"):
-            for attr in ("class", "style", "onclick", "id", "role"):
-                tag.attrs.pop(attr, None)
-
-    title = soup.title.string.strip() if soup.title and soup.title.string else ""
-    html = (
-        "<!DOCTYPE html>\n<html><head><meta charset='utf-8'>"
-        f"<title>{title}</title></head><body>{node.decode()}</body></html>"
-    )
-    return html.encode("utf-8")
-
-
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -130,8 +76,11 @@ def run_transformation(start_date: str, end_date: str) -> dict:
     end = parse_cli_date(end_date)
 
     mongo = get_mongo_client(cfg)
-    landing = mongo[cfg.mongo_db][cfg.mongo_landing_collection]
-    curated = mongo[cfg.mongo_db][cfg.mongo_curated_collection]
+    database = mongo[cfg.mongo_db]
+    landing = database[cfg.mongo_landing_collection]
+    state = database[cfg.mongo_state_collection]
+    curated = database[cfg.mongo_curated_collection]
+    
     # Same natural key as landing: one curated record per (source, body,
     # identifier). partition_date supports downstream date-range queries.
     curated.create_index(
@@ -153,15 +102,33 @@ def run_transformation(start_date: str, end_date: str) -> dict:
         "failed": [],
     }
 
-    for record in landing.find(query):
+    for current_state in state.find(query):
         stats["selected"] += 1
-        identifier = record["identifier"]
-        nat_key = {
-            "source": record.get("source"),
-            "body": record.get("body"),
-            "identifier": identifier,
-        }
+
+        identifier = current_state.get("identifier", "unknown")
+
         try:
+            version_id = current_state.get("latest_version_id")
+
+            if version_id is None:
+                raise ValueError(
+                    "Document state has no latest_version_id"
+                )
+
+            record = landing.find_one(
+                {"_id": version_id}
+            )
+
+            if record is None:
+                raise ValueError(
+                    f"Landing version {version_id} does not exist"
+                )
+
+            nat_key = {
+                "source": record.get("source"),
+                "body": record.get("body"),
+                "identifier": record["identifier"],
+            }
             existing = curated.find_one(
                 nat_key,
                 {"source_file_hash": 1, "parser_version": 1},
@@ -188,12 +155,29 @@ def run_transformation(start_date: str, end_date: str) -> dict:
                 new_hash = record["file_hash"]
                 content_type = record.get("content_type") or "application/octet-stream"
             else:
-                out_bytes = extract_relevant_html(  # requirement 1.c.ii
-                    raw, cfg.html_selector_list, cfg.html_parser
+                canonical = canonicalize_html(
+                    raw,
+                    selectors=cfg.html_selector_list,
+                    parser=cfg.html_parser,
+                    drop_selectors=cfg.html_drop_selector_list,
+                    min_text_chars=cfg.html_min_text_chars,
                 )
+
+                out_bytes = canonical.html_bytes
                 new_hash = sha256_bytes(out_bytes)
                 content_type = "text/html; charset=utf-8"
                 ext = "html"
+
+                logger.info(
+                    "extracted relevant HTML content",
+                    extra={
+                        "identifier": identifier,
+                        "selector_used": canonical.selector_used,
+                        "fallback_used": canonical.fallback_used,
+                        "extracted_text_length": canonical.text_length,
+                        "parser_used": canonical.parser_used,
+                    },
+                )
 
             # Requirement: file NAME becomes <identifier>.<ext>. We keep that
             # basename but namespace the prefix by body so the key can never
