@@ -220,9 +220,33 @@ class WrcSpider(scrapy.Spider):
         meta = response.meta
         key = (meta["partition_label"], meta["body"])
 
+        # Extract once so we can distinguish an empty result set from a broken
+        # total-count parser.
+        records = list(self._extract_records(response))
+
         if meta["page"] == 1:
             total = self._extract_total(response)
-            if total is None:
+
+            if total is None and not records:
+                # Successful search page with no result cards means zero records.
+                total = 0
+                self.run_stats[key]["found"] = 0
+                self.run_stats[key]["count_parse_failed"] = False
+
+                self.logger.info(
+                    "search returned no records",
+                    extra={
+                        "partition": meta["partition_label"],
+                        "body": meta["body"],
+                        "records_found": 0,
+                        "url": response.url,
+                    },
+                )
+
+            elif total is None:
+                # Cards exist but the total-count text was not understood.
+                # This is a real parsing problem and must not be reported as zero.
+                self.run_stats[key]["found"] = None
                 self.run_stats[key]["count_parse_failed"] = True
 
                 self.logger.error(
@@ -231,41 +255,70 @@ class WrcSpider(scrapy.Spider):
                         "partition": meta["partition_label"],
                         "body": meta["body"],
                         "url": response.url,
-                        "page": 1,
+                        "visible_result_cards": len(records),
                     },
                 )
+
             else:
                 self.run_stats[key]["found"] = total
-            self.logger.info(
-                "search results",
-                extra={
-                    "partition": meta["partition_label"],
-                    "body": meta["body"],
-                    "records_found": total,
-                },
-            )
-            # Fan out the remaining pages now that we know the total.
-            if total:
+                self.run_stats[key]["count_parse_failed"] = False
+
+                self.logger.info(
+                    "search results",
+                    extra={
+                        "partition": meta["partition_label"],
+                        "body": meta["body"],
+                        "records_found": total,
+                    },
+                )
+
+            # Request remaining pages only when a positive total was parsed.
+            if total is not None and total > 0:
                 pages = math.ceil(total / self.per_page)
+
                 for page in range(2, pages + 1):
                     url = self._search_url(
-                        meta["win_start"], meta["win_end"], meta["body_code"], page
+                        meta["win_start"],
+                        meta["win_end"],
+                        meta["body_code"],
+                        page,
                     )
+
                     yield scrapy.Request(
                         url,
                         callback=self.parse_results,
                         errback=self.on_request_failed,
                         dont_filter=True,
-                        meta={**meta, "page": page},
+                        meta={
+                            "body": meta["body"],
+                            "body_code": meta["body_code"],
+                            "partition_date": meta["partition_date"],
+                            "partition_label": meta["partition_label"],
+                            "win_start": meta["win_start"],
+                            "win_end": meta["win_end"],
+                            "page": page,
+                        },
                     )
 
-        for rec in self._extract_records(response):
+        # Continue processing the records already extracted above.
+        for rec in records:
             identifier = rec["identifier"]
-            nat_key = (self.source, meta["body"], identifier)
-            if self.cfg.skip_existing_identifiers and nat_key in self.known_hashes:
+            nat_key = (
+                self.source,
+                meta["body"],
+                identifier,
+            )
+
+            if (
+                self.cfg.skip_existing_identifiers
+                and nat_key in self.known_hashes
+            ):
                 self.logger.info(
                     "skipping existing identifier (fast mode)",
-                    extra={"identifier": identifier, **_ctx(meta)},
+                    extra={
+                        "identifier": identifier,
+                        **_ctx(meta),
+                    },
                 )
                 continue
 
@@ -281,12 +334,18 @@ class WrcSpider(scrapy.Spider):
                 source=self.source,
                 scraped_at=datetime.now(timezone.utc).isoformat(),
             )
+
             ext = _url_extension(rec["doc_url"])
+
             yield scrapy.Request(
                 rec["doc_url"],
                 callback=self.parse_document,
                 errback=self.on_document_failed,
-                meta={"item": item, "ext_hint": ext, **_ctx(meta)},
+                meta={
+                    "item": item,
+                    "ext_hint": ext,
+                    **_ctx(meta),
+                },
                 dont_filter=False,
             )
 

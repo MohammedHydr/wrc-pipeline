@@ -46,31 +46,20 @@ from config.html_utils import canonicalize_html
 
 logger = logging.getLogger("transform")
 
-STRIP_TAGS = [
-    "script",
-    "style",
-    "nav",
-    "header",
-    "footer",
-    "form",
-    "button",
-    "noscript",
-    "iframe",
-    "aside",
-]
 PASSTHROUGH_EXTS = {"pdf", "doc", "docx", "rtf"}
 
 # Bump when the HTML-cleaning logic changes: records transformed with an older
 # parser version are re-transformed on the next run (landing stays untouched).
-PARSER_VERSION = "1.0"
+PARSER_VERSION = "1.1"
 
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def run_transformation(start_date: str, end_date: str) -> dict:
+def run_transformation(start_date: str, end_date: str, *, configure_logging: bool = True,) -> dict:
     cfg = get_settings()
     run_id = new_run_id()
-    configure_json_logging(cfg.log_level, run_id=run_id)
+    if configure_logging:
+        configure_json_logging(cfg.log_level, run_id=run_id,)
 
     start = parse_cli_date(start_date)
     end = parse_cli_date(end_date)
@@ -131,11 +120,11 @@ def run_transformation(start_date: str, end_date: str) -> dict:
             }
             existing = curated.find_one(
                 nat_key,
-                {"source_file_hash": 1, "parser_version": 1},
+                {"source_version_id": 1, "parser_version": 1},
             )
             if (
                 existing
-                and existing.get("source_file_hash") == record["file_hash"]
+                and existing.get("source_version_id") == version_id
                 and existing.get("parser_version") == PARSER_VERSION
             ):
                 stats["skipped_unchanged"] += 1
@@ -148,13 +137,25 @@ def run_transformation(start_date: str, end_date: str) -> dict:
             bucket, key = _parse_s3_uri(record["file_path"])
             obj = s3.get_object(Bucket=bucket, Key=key)
             raw = obj["Body"].read()
+            downloaded_hash = sha256_bytes(raw)
 
-            ext = record["file_ext"]
+            if downloaded_hash != record["file_hash"]:
+                raise ValueError(
+                    "Landing object hash mismatch for "
+                    f"{identifier}: metadata={record['file_hash']} "
+                    f"downloaded={downloaded_hash}"
+                )
+            ext = str(record["file_ext"]).lower()
+
             if ext in PASSTHROUGH_EXTS:
-                out_bytes = raw  # requirement 1.c.i
-                new_hash = record["file_hash"]
-                content_type = record.get("content_type") or "application/octet-stream"
-            else:
+                out_bytes = raw
+                new_hash = downloaded_hash
+                content_type = (
+                    record.get("content_type")
+                    or "application/octet-stream"
+                )
+
+            elif ext == "html":
                 canonical = canonicalize_html(
                     raw,
                     selectors=cfg.html_selector_list,
@@ -166,7 +167,6 @@ def run_transformation(start_date: str, end_date: str) -> dict:
                 out_bytes = canonical.html_bytes
                 new_hash = sha256_bytes(out_bytes)
                 content_type = "text/html; charset=utf-8"
-                ext = "html"
 
                 logger.info(
                     "extracted relevant HTML content",
@@ -177,6 +177,11 @@ def run_transformation(start_date: str, end_date: str) -> dict:
                         "extracted_text_length": canonical.text_length,
                         "parser_used": canonical.parser_used,
                     },
+                )
+
+            else:
+                raise ValueError(
+                    f"Unsupported landing file extension: {ext!r}"
                 )
 
             # Requirement: file NAME becomes <identifier>.<ext>. We keep that
@@ -212,6 +217,8 @@ def run_transformation(start_date: str, end_date: str) -> dict:
                 "file_hash": new_hash,
                 "size_bytes": len(out_bytes),
                 # Lineage back to the exact landing version this was derived from
+                "source_version_id": version_id,
+                "source_content_hash": record["content_hash"],
                 "source_file_path": record["file_path"],
                 "source_file_hash": record["file_hash"],
                 "parser_version": PARSER_VERSION,
@@ -241,8 +248,15 @@ def run_transformation(start_date: str, end_date: str) -> dict:
 
 
 def _parse_s3_uri(uri: str) -> tuple[str, str]:
+    if not uri.startswith("s3://"):
+        raise ValueError(f"Invalid S3 URI: {uri!r}")
+
     without_scheme = uri.removeprefix("s3://")
-    bucket, _, key = without_scheme.partition("/")
+    bucket, separator, key = without_scheme.partition("/")
+
+    if not separator or not bucket or not key:
+        raise ValueError(f"Invalid S3 URI: {uri!r}")
+
     return bucket, key
 
 

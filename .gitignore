@@ -1,4 +1,4 @@
-.venv/
+.venv*
 __pycache__/
 *.pyc
 .env
@@ -49,3 +49,5 @@ Thumbs.db
 .claude/settings.local.json
 .claude/
 CLAUDE.md
+.tmp_dagster_home_yu_itb2a
+.dagster_home

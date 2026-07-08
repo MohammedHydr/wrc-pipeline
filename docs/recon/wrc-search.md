@@ -76,3 +76,22 @@ View-Page links go to case pages at `/en/cases/YYYY/month/<ref>.html` — the
 decision is rendered as HTML on that page, so it's stored as `.html` (the
 transform later strips boilerplate). Any link ending in `.pdf/.doc/.docx/.rtf`
 is stored byte-for-byte instead.
+
+
+## Official search guide
+
+The advanced-search page links to the WRC Decisions Information Guide:
+
+`https://www.workplacerelations.ie/en/publications_forms/decisions_information_guide.pdf`
+
+The guide confirms:
+
+- four searchable bodies;
+- searches use the decision/determination date;
+- decision records may be stored as HTML or PDF;
+- PDF keyword searches examine only pre-tagged metadata rather than the
+  document body;
+- WRC Adjudication Officer decisions are available from October 2015 onward.
+
+The guide itself is supporting documentation and is intentionally excluded
+from ingestion because it is not a decision search-result record.

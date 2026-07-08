@@ -149,7 +149,8 @@ class HashAndDedupPipeline:
         )
 
         adapter["unchanged"] = unchanged
-
+        adapter["known_version"] = False
+        
         if not unchanged:
             # Content differs from the CURRENT state, but it may match an
             # OLDER immutable version (content flipped A -> B -> back to A).
@@ -346,73 +347,96 @@ class MongoMetadataPipeline:
             self._count_scraped(adapter, spider)
             return item
 
-        version_doc = {
-            key: adapter.get(key)
-            for key in (
-                "identifier",
-                "title",
-                "description",
-                "published_date",
-                "doc_url",
-                "body",
-                "partition_date",
-                "partition_label",
-                "source",
-                "scraped_at",
-                "file_ext",
-                "content_type",
-                "file_hash",
-                "content_hash",
-                "file_path",
-                "size_bytes",
+        if adapter.get("known_version"):
+            stored_version = self.versions.find_one(
+                _version_key(adapter)
             )
-        }
 
-        version_doc.update(
-            {
-                "schema_version": 1,
-                "first_seen_at": now,
-                "first_run_id": spider.run_id,
+            if stored_version is None:
+                raise RuntimeError(
+                    "Item was marked as a known historical version, "
+                    "but that immutable version could not be found: "
+                    f"{adapter.get('identifier')}"
+                )
+
+            version_id = stored_version["_id"]
+
+            logger.info(
+                "reusing immutable landing version",
+                extra={
+                    "identifier": adapter["identifier"],
+                    "version_id": str(version_id),
+                    "content_hash": adapter["content_hash"],
+                    "file_path": stored_version["file_path"],
+                },
+            )
+
+        else:
+            version_doc = {
+                key: adapter.get(key)
+                for key in (
+                    "identifier",
+                    "title",
+                    "description",
+                    "published_date",
+                    "doc_url",
+                    "body",
+                    "partition_date",
+                    "partition_label",
+                    "source",
+                    "scraped_at",
+                    "file_ext",
+                    "content_type",
+                    "file_hash",
+                    "content_hash",
+                    "file_path",
+                    "size_bytes",
+                )
             }
-        )
 
-        version_id = None
-        stored_version = version_doc
-
-        try:
-            result = self.versions.insert_one(version_doc)
-            version_id = result.inserted_id
-
-            logger.info(
-                "inserted immutable landing version",
-                extra={
-                    "identifier": adapter["identifier"],
-                    "version_id": str(version_id),
-                    "content_hash": adapter["content_hash"],
-                    "file_hash": adapter["file_hash"],
-                },
+            version_doc.update(
+                {
+                    "schema_version": 1,
+                    "first_seen_at": now,
+                    "first_run_id": spider.run_id,
+                }
             )
 
-        except DuplicateKeyError:
-            # This can happen when concurrent workers discover the same version.
-            # Retrieve the already-inserted immutable version and use it as the
-            # state target instead of modifying it.
-            existing_version = self.versions.find_one(_version_key(adapter))
+            stored_version = version_doc
 
-            if existing_version is None:
-                raise
+            try:
+                result = self.versions.insert_one(version_doc)
+                version_id = result.inserted_id
 
-            version_id = existing_version["_id"]
-            stored_version = existing_version
+                logger.info(
+                    "inserted immutable landing version",
+                    extra={
+                        "identifier": adapter["identifier"],
+                        "version_id": str(version_id),
+                        "content_hash": adapter["content_hash"],
+                        "file_hash": adapter["file_hash"],
+                    },
+                )
 
-            logger.info(
-                "landing version already exists",
-                extra={
-                    "identifier": adapter["identifier"],
-                    "version_id": str(version_id),
-                    "content_hash": adapter["content_hash"],
-                },
-            )
+            except DuplicateKeyError:
+                # Genuine concurrent insertion race.
+                stored_version = self.versions.find_one(
+                    _version_key(adapter)
+                )
+
+                if stored_version is None:
+                    raise
+
+                version_id = stored_version["_id"]
+
+                logger.info(
+                    "landing version already inserted concurrently",
+                    extra={
+                        "identifier": adapter["identifier"],
+                        "version_id": str(version_id),
+                        "content_hash": adapter["content_hash"],
+                    },
+                )
 
         state_doc = {
             "source": adapter["source"],
