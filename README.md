@@ -39,6 +39,8 @@ docker compose up -d          # starts MongoDB + MinIO (ports from .env:
 ```
 
 MinIO console: http://localhost:9001 (minioadmin / minioadmin by default).
+Mongo web UI (mongo-express): http://localhost:8081 (admin / admin by default) —
+browse the `wrc` database collections directly in the browser.
 
 ## 3. Run the scraper (standalone)
 
@@ -91,11 +93,35 @@ python -m transform.transform --start-date 2024-01-01 --end-date 2024-03-31
 * the landing zone is never modified; the step is idempotent (records whose
   source hash hasn't changed are skipped).
 
+### 4b. Run the enrichment (standalone, optional business layer)
+
+```bash
+python -m transform.enrich --start-date 2024-01-01 --end-date 2024-03-31
+```
+
+Deterministic BeautifulSoup/regex extraction (no ML) of business fields from
+each curated HTML decision into the `enriched_decisions` collection: parties,
+acts cited, adjudication officer, hearing date, award amounts (€), coarse
+outcome signals — with lineage to the exact curated artifact. Legacy binary
+scans are recorded as `extraction_status: binary_source` so text coverage
+stays measurable. Idempotent (skips unchanged source hash + extraction
+version). Example insight queries:
+
+```bash
+docker exec -it wrc-mongo mongosh -u root -p example
+> use wrc
+> db.enriched_decisions.aggregate([{$unwind:'$acts_cited'},{$group:{_id:'$acts_cited',n:{$sum:1}}},{$sort:{n:-1}},{$limit:5}])
+> db.enriched_decisions.aggregate([{$match:{award_max_eur:{$gt:0}}},{$group:{_id:null,n:{$sum:1},avg:{$avg:'$award_max_eur'}}}])
+```
+
 ## 5. Run via Dagster (recommended)
 
-Dagster runs the two steps as dependent ops in one job
-(`scrape_landing_zone >> transform_to_curated`). MongoDB and MinIO come from the
-Docker stack started above; Dagster, Scrapy, and the transform run natively.
+Dagster runs the steps as dependent ops in one job
+(`scrape_landing_zone >> transform_to_curated >> enrich_decisions`). MongoDB
+and MinIO come from the Docker stack started above; Dagster, Scrapy, and the
+transform run natively. A monthly schedule (`wrc_monthly_incremental`, 06:00
+on the 2nd, Europe/Dublin) re-runs the job for the previous calendar month —
+idempotency makes the incremental rerun safe by construction.
 
 ```bash
 export PYTHONPATH=$PWD                     # so ops can import config/ and transform/

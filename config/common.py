@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import sys
 import uuid
 from datetime import date, datetime, timedelta
@@ -134,6 +135,21 @@ def slug(value: str) -> str:
     name) for use in deterministic storage-key prefixes. Source values are
     preserved verbatim in metadata; only keys are normalised."""
     return "".join(c.lower() if c.isalnum() else "-" for c in value).strip("-")
+
+
+def safe_identifier(value: str) -> str:
+    """Filesystem/object-key-safe form of a source identifier for storage keys.
+
+    Some sources emit identifiers containing path- and filename-hostile
+    characters (EAT: ``RP89/2008, MN99/2008``; WRC: ``IR - SC - 00001595``).
+    A raw ``/`` would introduce bogus key path segments, so any run of
+    characters outside ``A-Za-z0-9._-`` collapses to a single ``-`` (case is
+    kept — identifiers are case-stable and stay recognisable). The raw value
+    is preserved verbatim in metadata; only keys/filenames use this form.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value)
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-.")
+    return cleaned or "unknown"
 
 
 # --------------------------------------------------------------------------- #

@@ -338,3 +338,60 @@ def test_body_code_map_parses_configured_pairs():
     assert codes["Workplace Relations Commission"] == "15376"
     assert codes["Equality Tribunal"] == "1"
     assert codes["Employment Appeals Tribunal"] == "2"
+
+
+class _FakeFailure:
+    """Minimal stand-in for a twisted Failure passed to an errback."""
+
+    def __init__(self, request, message="Forbidden by robots.txt"):
+        self.request = request
+        self.value = Exception(message)
+        self._message = message
+
+    def getErrorMessage(self) -> str:
+        return self._message
+
+
+def test_pdf_follow_failure_falls_back_to_storing_html_wrapper():
+    # robots.txt forbids the legacy Equality_Tribunal_Import PDF paths; the
+    # errback must store the permitted HTML case page instead of failing.
+    spider = _spider()
+    key = ("2000-01-01_2000-01-31", "Equality Tribunal")
+    item = WrcDocumentItem(
+        identifier="DEC-E2000-14", body=key[1], partition_label=key[0]
+    )
+    request = Request(
+        "http://x/Equality_Tribunal_Import/DEC-E2000-14.pdf",
+        meta={
+            "item": item,
+            "ext_hint": "pdf",
+            "pdf_followed": True,
+            "wrapper_body": EQUALITY_CASE_HTML,
+            "wrapper_content_type": "text/html",
+            "partition_label": key[0],
+            "body": key[1],
+        },
+    )
+    out = list(spider.on_document_failed(_FakeFailure(request)))
+    assert len(out) == 1
+    assert out[0]["file_ext"] == "html"
+    assert out[0]["file_content"] == EQUALITY_CASE_HTML
+    # Not a failure: the wrapper item proceeds through the pipelines and is
+    # counted as scraped once fully persisted.
+    assert spider.run_stats[key]["failed"] == []
+
+
+def test_document_failure_without_fallback_payload_is_recorded():
+    spider = _spider()
+    key = ("2022-04-01_2022-04-30", "Workplace Relations Commission")
+    item = WrcDocumentItem(identifier="ADJ-1", body=key[1], partition_label=key[0])
+    request = Request(
+        "http://x/y.html",
+        meta={"item": item, "partition_label": key[0], "body": key[1]},
+    )
+    out = list(spider.on_document_failed(_FakeFailure(request, "504 timeout")))
+    assert out == []
+    failures = spider.run_stats[key]["failed"]
+    assert len(failures) == 1
+    assert failures[0]["identifier"] == "ADJ-1"
+    assert "504" in failures[0]["error"]

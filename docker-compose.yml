@@ -35,6 +35,23 @@ services:
       timeout: 5s
       retries: 5
 
+  # lightweight web UI for inspecting the Mongo collections (landing versions,
+  # document state, curated, run logs) without installing a desktop client
+  mongo-express:
+    image: mongo-express:latest
+    container_name: wrc-mongo-express
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      # talks to the mongo service over the compose network (internal port)
+      ME_CONFIG_MONGODB_URL: mongodb://${MONGO_ROOT_USER:-root}:${MONGO_ROOT_PASSWORD:-example}@mongo:27017/
+      ME_CONFIG_BASICAUTH_USERNAME: ${MONGO_EXPRESS_USER:-admin}
+      ME_CONFIG_BASICAUTH_PASSWORD: ${MONGO_EXPRESS_PASSWORD:-admin}
+    ports:
+      - "${MONGO_EXPRESS_PORT:-8081}:8081"
+
   # one-shot bucket bootstrap (idempotent)
   minio-init:
     image: minio/mc:latest

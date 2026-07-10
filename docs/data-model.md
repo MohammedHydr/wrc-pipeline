@@ -47,7 +47,7 @@ in MinIO are likewise append-only and never overwritten.
 | `content_type` | string | Response `Content-Type` header |
 | `file_hash` | string | SHA-256 of the exact stored bytes |
 | `content_hash` | string | SHA-256 of stable legal content (drives change detection) |
-| `file_path` | string | `s3://<landing-bucket>/body=…/partition=…/<identifier>/<file_hash>.<ext>` (bucket names the zone; no `raw/` prefix) |
+| `file_path` | string | `s3://<landing-bucket>/body=…/partition=…/<safe-identifier>/<file_hash>.<ext>` (bucket names the zone; no `raw/` prefix; the identifier segment is key-sanitised — e.g. `RP89/2008, MN99/2008` → `RP89-2008-MN99-2008` — while `identifier` stays verbatim) |
 | `size_bytes` | int | Exact byte size of the stored file |
 | `schema_version` | int | Record schema version |
 | `first_seen_at` | datetime | Insert-only; when this version was first stored |
@@ -104,7 +104,7 @@ through. Keeps full lineage back to the landing version it came from.
 | `source`, `body`, `identifier` | string | Natural key (from the upsert filter) |
 | `title`, `description`, `published_date`, `doc_url`, `partition_date`, `partition_label` | — | Carried from landing |
 | `file_ext` | string | `html` for cleaned pages; original ext for pass-through |
-| `file_path` | string | `s3://<curated-bucket>/body=…/partition=…/<identifier>.<ext>` — mirrors the landing layout (no `curated/` prefix); basename is `identifier.ext`. Curated is **latest-only**: a rewrite under a new key (e.g. ext HTML→PDF) deletes the superseded object |
+| `file_path` | string | `s3://<curated-bucket>/body=…/partition=…/<safe-identifier>.<ext>` — mirrors the landing layout (no `curated/` prefix); basename is the key-sanitised `identifier.ext`. Curated is **latest-only**: a rewrite under a new key (e.g. ext HTML→PDF) deletes the superseded object |
 | `file_hash` | string | SHA-256 of the **curated** bytes (recomputed for HTML) |
 | `size_bytes` | int | Byte size of the curated file |
 | `source_version_id` | ObjectId | Lineage: landing version this was derived from (drives skip-unchanged) |
@@ -121,6 +121,30 @@ through. Keeps full lineage back to the landing version it came from.
 |-------|------|---------|
 | `(source, body, identifier)` | **unique** | One curated record per document |
 | `(partition_date)` | plain | Downstream date-range queries |
+
+---
+
+## `enriched_decisions` — business layer (beyond spec)
+
+One record per `(source, body, identifier)`, derived from the curated
+artifact by deterministic BeautifulSoup/regex extraction (`transform/enrich.py`,
+no ML). HTML decisions get `extraction_status: "extracted"`; legacy binary
+scans get `"binary_source"` (would need OCR) so coverage stays measurable.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source`, `body`, `identifier` | string | Natural key (unique index) |
+| `complainant` / `respondent` | string? | Split from the listing description ("A v B") |
+| `adjudication_officer` | string? | From the labelled "Adjudication Officer:" line |
+| `hearing_date` | string (ISO)? | From "Date of (Adjudication) Hearing:" |
+| `acts_cited` | string[] | Statutes cited, e.g. `Unfair Dismissals Act 1977` |
+| `complaint_references` | string[] | `CA-XXXXXXXX-XXX` references |
+| `award_amounts_eur` / `award_max_eur` | number[] / number? | Monetary amounts found in the decision text |
+| `outcome_signals` | string[] | Coarse phrases found ("well founded", "dismissed", …) — signals, not a classification |
+| `extraction_status` | string | `extracted` \| `binary_source` |
+| `source_file_path` / `source_file_hash` | string | Lineage to the exact curated artifact |
+| `extraction_version` | string | Bump re-extracts without touching curated/landing |
+| `run_id` / `enriched_at` | string / datetime | Enrichment run provenance |
 
 ---
 

@@ -6,19 +6,27 @@ Execution order:
             |
             v
     transform_to_curated
+            |
+            v
+    enrich_decisions
 
 MongoDB and MinIO run through the existing Docker Compose stack.
 Dagster, Scrapy, and the transformation run natively on Windows.
+
+`wrc_monthly_incremental` schedules the same job for the previous calendar
+month, turning the backfill pipeline into a living monthly feed.
 """
 
 import os
 import subprocess
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import dagster as dg
 
 from config.common import parse_cli_date
+from transform.enrich import run_enrichment
 from transform.transform import run_transformation
 
 
@@ -232,19 +240,106 @@ def transform_to_curated(
         len(failures),
     )
 
+    # Carry the date window forward so downstream ops share the same range.
+    return {**stats, "start_date": start_date, "end_date": end_date}
+
+
+@dg.op(
+    name="enrich_decisions",
+    description=(
+        "Extract structured business fields (parties, acts cited, officer, "
+        "hearing date, award amounts, outcome signals) from curated HTML "
+        "decisions into the enriched collection."
+    ),
+)
+def enrich_decisions(
+    context: dg.OpExecutionContext,
+    transform_stats: dict,
+) -> dict:
+    """Run the curated-to-enriched structured extraction."""
+
+    start_date = transform_stats["start_date"]
+    end_date = transform_stats["end_date"]
+
+    context.log.info(
+        "Starting enrichment for %s through %s",
+        start_date,
+        end_date,
+    )
+
+    stats = run_enrichment(
+        start_date,
+        end_date,
+        configure_logging=False,
+    )
+
+    failures = stats.get("failed", [])
+
+    context.add_output_metadata(
+        {
+            "selected": stats.get("selected", 0),
+            "extracted": stats.get("extracted", 0),
+            "binary_source": stats.get("binary_source", 0),
+            "skipped_unchanged": stats.get("skipped_unchanged", 0),
+            "failed": len(failures),
+            "enrichment_run_id": stats.get("run_id", ""),
+        }
+    )
+
+    if failures:
+        raise dg.Failure(
+            description=(f"{len(failures)} enrichment record(s) failed: {failures}")
+        )
+
     return stats
 
 
 @dg.job(
     description=(
-        "Scrape WRC decisions into the immutable landing zone, "
-        "then transform their latest versions into the curated zone."
+        "Scrape WRC decisions into the immutable landing zone, transform "
+        "their latest versions into the curated zone, then extract "
+        "structured business fields into the enriched collection."
     )
 )
 def wrc_pipeline():
-    transform_to_curated(scrape_landing_zone())
+    enrich_decisions(transform_to_curated(scrape_landing_zone()))
+
+
+@dg.schedule(
+    cron_schedule="0 6 2 * *",  # 06:00 on the 2nd — previous month is complete
+    job=wrc_pipeline,
+    execution_timezone="Europe/Dublin",
+)
+def wrc_monthly_incremental(
+    context: dg.ScheduleEvaluationContext,
+) -> dg.RunRequest:
+    """Scrape/transform/enrich the previous calendar month.
+
+    Turns the backfill pipeline into a living monthly feed: hash-based change
+    detection keeps the rerun idempotent, so records already ingested are
+    observed (last_seen_at) rather than duplicated.
+    """
+    today = context.scheduled_execution_time.date()
+    prev_end = today.replace(day=1) - timedelta(days=1)
+    prev_start = prev_end.replace(day=1)
+
+    return dg.RunRequest(
+        run_config={
+            "ops": {
+                "scrape_landing_zone": {
+                    "config": {
+                        "start_date": prev_start.isoformat(),
+                        "end_date": prev_end.isoformat(),
+                        "partition": "monthly",
+                        "bodies": "",
+                    }
+                }
+            }
+        }
+    )
 
 
 defs = dg.Definitions(
     jobs=[wrc_pipeline],
+    schedules=[wrc_monthly_incremental],
 )

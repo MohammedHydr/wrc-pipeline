@@ -40,6 +40,7 @@ from config.common import (
     get_s3_client,
     new_run_id,
     parse_cli_date,
+    safe_identifier,
     sha256_bytes,
     slug,
 )
@@ -50,9 +51,10 @@ logger = logging.getLogger("transform")
 
 PASSTHROUGH_EXTS = {"pdf", "doc", "docx", "rtf"}
 
-# Bump when the HTML-cleaning logic changes: records transformed with an older
-# parser version are re-transformed on the next run (landing stays untouched).
-PARSER_VERSION = "1.1"
+# Bump when the HTML-cleaning logic or curated naming changes: records
+# transformed with an older parser version are re-transformed on the next run
+# (landing stays untouched; superseded curated objects are cleaned up).
+PARSER_VERSION = "1.2"
 
 
 # --------------------------------------------------------------------------- #
@@ -338,12 +340,18 @@ def _curated_object_key(
 
     Mirrors the landing layout (``body=`` / ``partition=`` Hive prefix) so both
     zones are navigable the same way, but the basename is ``<identifier>.<ext>``
-    as the rename requirement mandates. Curated is a *latest-only* derived view
-    (one object per logical document), so — unlike landing — there is no
-    content-hash version segment and a superseded object is deleted on rewrite.
+    as the rename requirement mandates — with the identifier key-sanitised so a
+    source value like ``RP89/2008, MN99/2008`` cannot split the filename into
+    extra path segments (raw identifiers stay verbatim in metadata). Curated is
+    a *latest-only* derived view (one object per logical document), so — unlike
+    landing — there is no content-hash version segment and a superseded object
+    is deleted on rewrite.
     """
 
-    return f"body={slug(body)}/partition={partition_date}/{identifier}.{ext}"
+    return (
+        f"body={slug(body)}/partition={partition_date}/"
+        f"{safe_identifier(identifier)}.{ext}"
+    )
 
 
 def _parse_s3_uri(uri: str) -> tuple[str, str]:

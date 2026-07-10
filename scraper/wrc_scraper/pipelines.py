@@ -43,6 +43,7 @@ from config.common import (
     ensure_bucket,
     get_mongo_client,
     get_s3_client,
+    safe_identifier,
     sha256_bytes,
     slug,
 )
@@ -77,13 +78,15 @@ def _landing_object_key(adapter: ItemAdapter) -> str:
     The bucket already names the zone, so the key is just the Hive-partitioned
     (``body=`` / ``partition=``) data layout. The content hash in the filename
     makes every distinct content version a new object, which is what keeps the
-    landing zone append-only.
+    landing zone append-only. The identifier segment is key-sanitised (EAT
+    identifiers such as ``RP89/2008, MN99/2008`` would otherwise inject extra
+    path levels); the raw identifier stays verbatim in metadata.
     """
 
     return (
         f"body={slug(adapter['body'])}/"
         f"partition={adapter['partition_date']}/"
-        f"{adapter['identifier']}/"
+        f"{safe_identifier(adapter['identifier'])}/"
         f"{adapter['file_hash']}.{adapter['file_ext']}"
     )
 

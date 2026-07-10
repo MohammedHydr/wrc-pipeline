@@ -518,6 +518,13 @@ class WrcSpider(scrapy.Spider):
                             "item": item,
                             "ext_hint": "pdf",
                             "pdf_followed": True,
+                            # Fallback payload: if the PDF fetch is denied
+                            # (e.g. robots.txt forbids the legacy import path)
+                            # or fails, the errback stores this permitted HTML
+                            # wrapper instead, so the record still ends
+                            # succeeded with the best allowed artifact.
+                            "wrapper_body": response.body,
+                            "wrapper_content_type": content_type,
                             **_ctx(response.meta),
                         },
                         dont_filter=False,
@@ -594,13 +601,43 @@ class WrcSpider(scrapy.Spider):
         request = failure.request
         meta = request.meta
         status = getattr(getattr(failure.value, "response", None), "status", None)
+        key = (meta.get("partition_label", "?"), meta.get("body", "?"))
+
+        # Embedded-PDF follow that carried a fallback payload: the authoritative
+        # PDF is unreachable (robots.txt forbids the legacy import paths, or the
+        # fetch failed), but the HTML case page it was embedded in is permitted
+        # and already downloaded. Store the wrapper as the record's artifact so
+        # the record ends succeeded with the best allowed content instead of
+        # failing on a document we are not allowed to fetch.
+        wrapper_body = meta.get("wrapper_body")
+        if wrapper_body:
+            item: WrcDocumentItem = meta["item"]
+            self.logger.warning(
+                "embedded decision PDF unavailable; storing HTML case page "
+                "as fallback artifact",
+                extra={
+                    "pdf_url": request.url,
+                    "identifier": item.get("identifier"),
+                    "error": failure.getErrorMessage(),
+                    "status": status,
+                    "partition": key[0],
+                    "body": key[1],
+                },
+            )
+            item["file_content"] = wrapper_body
+            item["file_ext"] = "html"
+            item["content_type"] = (
+                meta.get("wrapper_content_type") or "text/html; charset=utf-8"
+            )
+            yield item
+            return
+
         entry = {
             "url": request.url,
             "identifier": meta.get("item", {}).get("identifier"),
             "error": failure.getErrorMessage(),
             "status": status,
         }
-        key = (meta.get("partition_label", "?"), meta.get("body", "?"))
         self.run_stats[key]["failed"].append(entry)
         self.logger.error(
             "document download failed",

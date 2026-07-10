@@ -101,6 +101,7 @@ class Settings(BaseSettings):
     mongo_landing_collection: str = Field(default="landing_document_versions")
     mongo_state_collection: str = Field(default="document_state")
     mongo_curated_collection: str = Field(default="curated_documents")
+    mongo_enriched_collection: str = Field(default="enriched_decisions")
     mongo_run_log_collection: str = Field(default="run_logs")
 
     # ------------------------------------------------------------------ #
