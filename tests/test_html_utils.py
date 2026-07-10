@@ -181,3 +181,46 @@ def test_semantic_table_attributes_are_preserved() -> None:
     assert 'colspan="2"' in output
     assert 'class="heading"' not in output
     assert 'class="visual-only"' not in output
+
+
+def test_need_html_false_matches_content_bytes_and_skips_html() -> None:
+    """The scraper's change-detection path (need_html=False) must produce the
+    exact same content hash input as the full path, while skipping the
+    curated-HTML serialization it does not use."""
+
+    raw = b"""
+    <html>
+      <head><title>Decision</title></head>
+      <body>
+        <nav>Navigation</nav>
+        <main id="generated-1" class="content">
+          <h1 style="color:red">ADJ-00000003</h1>
+          <p>
+            This is a sufficiently long legal decision paragraph containing
+            enough visible text for the configured selector to be accepted by
+            the canonicalizer during change detection.
+          </p>
+          <table data-request-id="42">
+            <tr><th colspan="2">Parties</th></tr>
+            <tr><td>Worker</td><td>Employer</td></tr>
+          </table>
+        </main>
+        <footer>Footer 42</footer>
+      </body>
+    </html>
+    """
+
+    full = canonicalize_html(raw, selectors=["main"], min_text_chars=20)
+    light = canonicalize_html(
+        raw, selectors=["main"], min_text_chars=20, need_html=False
+    )
+
+    # Change detection hashes content_bytes, so it must be identical.
+    assert light.content_bytes == full.content_bytes
+    assert light.text_length == full.text_length
+    assert light.selector_used == full.selector_used
+    assert light.fallback_used == full.fallback_used
+
+    # The curated HTML is intentionally not produced on this path.
+    assert light.html_bytes == b""
+    assert full.html_bytes != b""

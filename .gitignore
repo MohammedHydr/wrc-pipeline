@@ -49,5 +49,5 @@ Thumbs.db
 .claude/settings.local.json
 .claude/
 CLAUDE.md
-.tmp_dagster_home_yu_itb2a
+.tmp*
 .dagster_home

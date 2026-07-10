@@ -15,7 +15,7 @@ import logging
 import re
 from dataclasses import dataclass
 from html import escape
-from typing import Sequence
+from typing import Any, Sequence
 
 from bs4 import BeautifulSoup, Comment, FeatureNotFound, NavigableString, Tag
 
@@ -97,6 +97,7 @@ def canonicalize_html(
     parser: str = "lxml",
     drop_selectors: Sequence[str] = (),
     min_text_chars: int = 200,
+    need_html: bool = True,
 ) -> CanonicalHtmlResult:
     """Extract and deterministically serialize relevant document content.
 
@@ -120,6 +121,14 @@ def canonicalize_html(
             Additional CSS selectors for source-specific page chrome.
         min_text_chars:
             Minimum normalized text length for a selector to be accepted.
+        need_html:
+            When True (default) the deterministic curated HTML is built and
+            returned in ``html_bytes``. When False — the scraper's change-
+            detection path, which only needs ``content_bytes`` for the content
+            hash — attribute cleaning, text-node rewriting and serialization are
+            skipped and ``html_bytes`` is empty. ``content_bytes`` is identical
+            either way (whitespace normalization is idempotent under the final
+            text collapse).
 
     Raises:
         HtmlCanonicalizationError:
@@ -136,9 +145,7 @@ def canonicalize_html(
 
     soup, parser_used = _parse_html(raw, parser)
 
-    title = _normalize_text(
-        soup.title.get_text(" ", strip=True) if soup.title else ""
-    )
+    title = _normalize_text(soup.title.get_text(" ", strip=True) if soup.title else "")
 
     _remove_comments(soup)
     _remove_tags(soup)
@@ -154,6 +161,24 @@ def canonicalize_html(
     if node is None:
         node = soup.body or soup
 
+    if not need_html:
+        # Change-detection path: only the visible-text hash is needed, so skip
+        # attribute cleaning, text-node rewriting and serialization entirely.
+        canonical_text = _normalize_text(node.get_text(" ", strip=True))
+        if not canonical_text:
+            raise HtmlCanonicalizationError(
+                "HTML document contains no meaningful visible content"
+            )
+
+        return CanonicalHtmlResult(
+            html_bytes=b"",
+            content_bytes=canonical_text.encode("utf-8"),
+            selector_used=selector_used,
+            fallback_used=fallback_used,
+            text_length=len(canonical_text),
+            parser_used=parser_used,
+        )
+
     _clean_attributes(node)
     _normalize_text_nodes(node)
 
@@ -168,7 +193,7 @@ def canonicalize_html(
         "<!doctype html>"
         "<html>"
         "<head>"
-        "<meta charset=\"utf-8\">"
+        '<meta charset="utf-8">'
         f"<title>{escape(title)}</title>"
         "</head>"
         f"<body>{body_html}</body>"
@@ -210,11 +235,15 @@ def _remove_comments(soup: BeautifulSoup) -> None:
 
 
 def _remove_tags(soup: BeautifulSoup) -> None:
-    """Remove globally irrelevant and volatile elements."""
+    """Remove globally irrelevant and volatile elements.
 
-    for tag_name in STRIP_TAGS:
-        for tag in soup.find_all(tag_name):
-            tag.decompose()
+    ``find_all`` accepts a list of names and matches any of them in a single
+    tree traversal, so all ``STRIP_TAGS`` are removed in one pass instead of
+    one full walk per tag name.
+    """
+
+    for tag in soup.find_all(list(STRIP_TAGS)):
+        tag.decompose()
 
 
 def _remove_selected_elements(
@@ -290,7 +319,7 @@ def _clean_attributes(node: Tag) -> None:
             frozenset(),
         )
 
-        cleaned_attributes: dict[str, object] = {}
+        cleaned_attributes: dict[str, Any] = {}
         for attribute in sorted(allowed):
             if attribute in element.attrs:
                 cleaned_attributes[attribute] = element.attrs[attribute]
@@ -335,4 +364,4 @@ def _serialize_contents(node: Tag) -> str:
 def _normalize_text(value: str) -> str:
     """Collapse all Unicode whitespace into single spaces."""
 
-    return _WHITESPACE_RE.sub(" ", value).strip()   
+    return _WHITESPACE_RE.sub(" ", value).strip()

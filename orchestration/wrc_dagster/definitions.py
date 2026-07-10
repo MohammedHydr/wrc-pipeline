@@ -72,9 +72,7 @@ def _subprocess_environment() -> dict[str, str]:
     existing_pythonpath = env.get("PYTHONPATH")
 
     if existing_pythonpath:
-        env["PYTHONPATH"] = (
-            f"{REPO_ROOT}{os.pathsep}{existing_pythonpath}"
-        )
+        env["PYTHONPATH"] = f"{REPO_ROOT}{os.pathsep}{existing_pythonpath}"
     else:
         env["PYTHONPATH"] = str(REPO_ROOT)
 
@@ -144,9 +142,7 @@ def scrape_landing_zone(
 
     if process.stdout is None:
         process.kill()
-        raise dg.Failure(
-            description="Could not capture the Scrapy process output."
-        )
+        raise dg.Failure(description="Could not capture the Scrapy process output.")
 
     for line in process.stdout:
         clean_line = line.rstrip()
@@ -159,8 +155,7 @@ def scrape_landing_zone(
     if return_code != 0:
         raise dg.Failure(
             description=(
-                "Scrapy landing-zone task failed with exit code "
-                f"{return_code}."
+                f"Scrapy landing-zone task failed with exit code {return_code}."
             )
         )
 
@@ -225,10 +220,7 @@ def transform_to_curated(
 
     if failures:
         raise dg.Failure(
-            description=(
-                f"{len(failures)} transformation record(s) failed: "
-                f"{failures}"
-            )
+            description=(f"{len(failures)} transformation record(s) failed: {failures}")
         )
 
     context.log.info(
@@ -250,9 +242,7 @@ def transform_to_curated(
     )
 )
 def wrc_pipeline():
-    transform_to_curated(
-        scrape_landing_zone()
-    )
+    transform_to_curated(scrape_landing_zone())
 
 
 defs = dg.Definitions(

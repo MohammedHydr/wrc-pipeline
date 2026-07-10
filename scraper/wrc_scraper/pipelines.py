@@ -71,6 +71,23 @@ def _version_key(adapter: ItemAdapter) -> dict[str, Any]:
     }
 
 
+def _landing_object_key(adapter: ItemAdapter) -> str:
+    """Deterministic, collision-safe key for one immutable landing object.
+
+    The bucket already names the zone, so the key is just the Hive-partitioned
+    (``body=`` / ``partition=``) data layout. The content hash in the filename
+    makes every distinct content version a new object, which is what keeps the
+    landing zone append-only.
+    """
+
+    return (
+        f"body={slug(adapter['body'])}/"
+        f"partition={adapter['partition_date']}/"
+        f"{adapter['identifier']}/"
+        f"{adapter['file_hash']}.{adapter['file_ext']}"
+    )
+
+
 class HashAndDedupPipeline:
     """Calculate hashes and detect unchanged documents."""
 
@@ -113,6 +130,9 @@ class HashAndDedupPipeline:
                 parser=self.cfg.html_parser,
                 drop_selectors=self.cfg.html_drop_selector_list,
                 min_text_chars=self.cfg.html_min_text_chars,
+                # Change detection only needs content_bytes for the hash; the
+                # curated HTML is produced later by the transform step.
+                need_html=False,
             )
 
             adapter["content_hash"] = sha256_bytes(canonical.content_bytes)
@@ -150,7 +170,7 @@ class HashAndDedupPipeline:
 
         adapter["unchanged"] = unchanged
         adapter["known_version"] = False
-        
+
         if not unchanged:
             # Content differs from the CURRENT state, but it may match an
             # OLDER immutable version (content flipped A -> B -> back to A).
@@ -225,12 +245,7 @@ class ObjectStoragePipeline:
             # version — the raw object for these bytes already exists.
             return item
 
-        key = (
-            f"raw/body={slug(adapter['body'])}/"
-            f"partition={adapter['partition_date']}/"
-            f"{adapter['identifier']}/"
-            f"{adapter['file_hash']}.{adapter['file_ext']}"
-        )
+        key = _landing_object_key(adapter)
 
         self.s3.put_object(
             Bucket=self.cfg.s3_landing_bucket,
@@ -348,9 +363,7 @@ class MongoMetadataPipeline:
             return item
 
         if adapter.get("known_version"):
-            stored_version = self.versions.find_one(
-                _version_key(adapter)
-            )
+            stored_version = self.versions.find_one(_version_key(adapter))
 
             if stored_version is None:
                 raise RuntimeError(
@@ -420,9 +433,7 @@ class MongoMetadataPipeline:
 
             except DuplicateKeyError:
                 # Genuine concurrent insertion race.
-                stored_version = self.versions.find_one(
-                    _version_key(adapter)
-                )
+                stored_version = self.versions.find_one(_version_key(adapter))
 
                 if stored_version is None:
                     raise

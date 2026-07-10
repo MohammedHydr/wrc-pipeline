@@ -17,6 +17,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = PROJECT_ROOT / ".env"
 
+
 class Settings(BaseSettings):
     """Typed, validated application settings."""
 
@@ -73,6 +74,16 @@ class Settings(BaseSettings):
     retry_times: int = Field(default=4)
     download_timeout: int = Field(default=60)
     robotstxt_obey: bool = Field(default=True)
+    # The WRC search + document flow is stateless GET (recon: no session
+    # cookie is required), so the cookie middleware is pure overhead and can
+    # set volatile tracking cookies. Disabling it drops that per-request cost.
+    cookies_enabled: bool = Field(default=False)
+    # Memory guard: documents are buffered in memory before hashing/storage, so
+    # cap the download size. A response over the max is cancelled and recorded
+    # as an auditable document failure (never silently lost); warnsize only
+    # logs. Bytes; raise via env if a legitimately larger document appears.
+    download_maxsize: int = Field(default=268_435_456)  # 256 MiB
+    download_warnsize: int = Field(default=33_554_432)  # 32 MiB
     user_agent: str = Field(
         default=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -85,7 +96,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     # MongoDB (metadata store)
     # ------------------------------------------------------------------ #
-    mongo_uri: str = Field(...)    
+    mongo_uri: str = Field(...)
     mongo_db: str = Field(default="wrc")
     mongo_landing_collection: str = Field(default="landing_document_versions")
     mongo_state_collection: str = Field(default="document_state")
@@ -101,7 +112,6 @@ class Settings(BaseSettings):
     s3_region: str = Field(default="us-east-1")
     s3_landing_bucket: str = Field(default="wrc-landing")
     s3_curated_bucket: str = Field(default="wrc-curated")
-    s3_secure: bool = Field(default=False)
 
     # ------------------------------------------------------------------ #
     # Behaviour toggles
@@ -111,6 +121,22 @@ class Settings(BaseSettings):
     # skipped for those records). If False (default), documents are
     # re-fetched, hashed, and only re-uploaded/updated when the hash differs.
     skip_existing_identifiers: bool = Field(default=False)
+
+    # The WRC search endpoint links every result to an HTML case page, but the
+    # earliest legacy imports (Equality Tribunal ~2000-2003, EAT legacy) embed
+    # the authoritative decision as a PDF *inside* that page. When True, the
+    # spider follows that embedded decision PDF and stores it byte-for-byte
+    # instead of the HTML wrapper. Set False to always store the HTML page.
+    follow_embedded_pdf: bool = Field(default=True)
+    # PDF links present as site chrome on every page (never a decision); matched
+    # case-insensitively against the link and skipped when following.
+    embedded_pdf_exclude: str = Field(
+        default="cookie_policy.pdf,decisions_information_guide.pdf"
+    )
+    # Path substrings that positively identify a legacy decision PDF whose
+    # filename does not contain the identifier (e.g. EAT's GUID-named PDFs under
+    # /eat_import/). An identifier match is always accepted regardless.
+    embedded_pdf_path_markers: str = Field(default="_import/,database-of-decisions")
 
     # Transformation
     html_content_selectors: str = Field(
@@ -123,16 +149,22 @@ class Settings(BaseSettings):
     # no extra dep) is a portable fallback if lxml is unavailable.
     html_parser: str = Field(default="lxml")
     html_drop_selectors: str = Field(
-    default=(
-        ".cookie-banner,.cookie-consent,.cookies,"
-        ".breadcrumb,.breadcrumbs,"
-        ".social-share,.share-tools,"
-        ".document-actions,.page-actions,"
-        ".return-to-search,.print-controls"
+        default=(
+            ".cookie-banner,.cookie-consent,.cookies,"
+            ".breadcrumb,.breadcrumbs,"
+            ".social-share,.share-tools,"
+            ".document-actions,.page-actions,"
+            ".return-to-search,.print-controls"
         )
     )
 
     html_min_text_chars: int = Field(default=200, ge=1)
+
+    # Number of worker threads the transform step uses to process records. The
+    # step is I/O-bound (S3 GET/PUT + Mongo per record), so threads overlap that
+    # latency. pymongo and botocore low-level clients are both thread-safe, so a
+    # single client is shared across workers. Set to 1 for fully sequential.
+    transform_workers: int = Field(default=8, ge=1)
 
     # Logging
     log_level: str = Field(default="INFO")
@@ -167,10 +199,26 @@ class Settings(BaseSettings):
         ]
 
     @property
+    def embedded_pdf_exclude_list(self) -> List[str]:
+        return [
+            x.strip().lower() for x in self.embedded_pdf_exclude.split(",") if x.strip()
+        ]
+
+    @property
+    def embedded_pdf_path_marker_list(self) -> List[str]:
+        return [
+            x.strip().lower()
+            for x in self.embedded_pdf_path_markers.split(",")
+            if x.strip()
+        ]
+
+    @property
     def search_url(self) -> str:
         return self.wrc_base_url.rstrip("/") + self.wrc_search_path
 
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    # mongo_uri (and other required fields) are populated from the environment
+    # / .env by pydantic-settings, which mypy cannot see at the call site.
+    return Settings()  # type: ignore[call-arg]

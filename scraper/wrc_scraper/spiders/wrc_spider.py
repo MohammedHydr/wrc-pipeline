@@ -36,7 +36,7 @@ import math
 import re
 from collections import defaultdict
 from datetime import date, datetime, timezone
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import AsyncIterator, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import scrapy
@@ -94,6 +94,9 @@ class WrcSpider(scrapy.Spider):
         self.bodies: List[str] = (
             [b.strip() for b in bodies.split(",")] if bodies else self.cfg.bodies_list
         )
+        # Legacy embedded-decision-PDF detection (see _embedded_decision_pdf).
+        self.pdf_exclude: List[str] = self.cfg.embedded_pdf_exclude_list
+        self.pdf_path_markers: List[str] = self.cfg.embedded_pdf_path_marker_list
 
         self.partitions: List[Tuple[date, date]] = list(
             iter_partitions(self.start_date, self.end_date, self.partition_size)
@@ -114,6 +117,18 @@ class WrcSpider(scrapy.Spider):
                 "scraped": 0,
                 "unchanged": 0,
                 "failed": [],
+                # Listing cards discovered but unusable (missing identifier/link):
+                # counted in "found" by the site total, so they must reach an
+                # auditable state here rather than being silently dropped.
+                "parse_failures": [],
+                # Records intentionally not fetched this run (fast-mode skip of an
+                # already-known identifier). Counted so reconciliation still holds.
+                "skipped": 0,
+                # Document requests actually enqueued for download. Reconciled at
+                # close against terminal states (scraped + failed); any positive
+                # remainder is a silent loss (e.g. a callback-level exception or a
+                # request dropped at shutdown) that would otherwise vanish.
+                "docs_enqueued": 0,
                 "listing_failures": [],
                 "count_parse_failed": False,
             }
@@ -124,7 +139,10 @@ class WrcSpider(scrapy.Spider):
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
         spider = super().from_crawler(crawler, *args, **kwargs)
-        spider._load_known_hashes()
+        # Only pay the full landing-collection scan when fast mode will actually
+        # consult it; the default (hash-compare) mode never reads known_hashes.
+        if spider.cfg.skip_existing_identifiers:
+            spider._load_known_hashes()
 
         crawler.signals.connect(
             spider._on_item_error,
@@ -165,7 +183,7 @@ class WrcSpider(scrapy.Spider):
     # ------------------------------------------------------------------ #
     # Step 1: fan out (body x partition) page-1 search requests
     # ------------------------------------------------------------------ #
-    async def start(self) -> Iterable[scrapy.Request]:
+    async def start(self) -> AsyncIterator[scrapy.Request]:
         for body in self.bodies:
             code = self.body_codes.get(body)
             if code is None:
@@ -309,10 +327,8 @@ class WrcSpider(scrapy.Spider):
                 identifier,
             )
 
-            if (
-                self.cfg.skip_existing_identifiers
-                and nat_key in self.known_hashes
-            ):
+            if self.cfg.skip_existing_identifiers and nat_key in self.known_hashes:
+                self.run_stats[key]["skipped"] += 1
                 self.logger.info(
                     "skipping existing identifier (fast mode)",
                     extra={
@@ -336,6 +352,12 @@ class WrcSpider(scrapy.Spider):
             )
 
             ext = _url_extension(rec["doc_url"])
+
+            # Count the request as enqueued *before* yielding it: closed()
+            # reconciles docs_enqueued against terminal states so a request that
+            # is later dropped without a callback/errback (silent loss) is still
+            # surfaced rather than quietly reducing the scraped count.
+            self.run_stats[key]["docs_enqueued"] += 1
 
             yield scrapy.Request(
                 rec["doc_url"],
@@ -364,6 +386,10 @@ class WrcSpider(scrapy.Spider):
           * date         -> span.date (DD/MM/YYYY)
           * description  -> p.description@title (parties)
         """
+        # A response is only guaranteed to carry meta when tied to a request;
+        # fall back to placeholders so parse-failure accounting still works.
+        meta = response.request.meta if response.request is not None else {}
+        key = (meta.get("partition_label", "?"), meta.get("body", "?"))
         cards = response.css("li.each-item")
         for card in cards:
             identifier = (card.css("span.refNO::text").get() or "").strip()
@@ -372,9 +398,22 @@ class WrcSpider(scrapy.Spider):
                 or card.css("h2.title a::attr(href)").get()
             )
             if not identifier or not href:
-                self.logger.warning(
-                    "result card missing identifier or link; skipped",
-                    extra={"identifier": identifier or None, "href": href},
+                # The card counts toward the site's total ("of N results") but we
+                # cannot build a document identity from it. Record it as an
+                # auditable parse failure so `found` still reconciles to
+                # scraped + failed + parse_failures + ... instead of silently
+                # dropping the record and leaving an unexplained shortfall.
+                entry = {
+                    "url": response.url,
+                    "identifier": identifier or None,
+                    "href": href,
+                    "stage": "listing_parse",
+                    "error": "result card missing identifier or link",
+                }
+                self.run_stats[key]["parse_failures"].append(entry)
+                self.logger.error(
+                    "result card missing identifier or link; recorded as parse failure",
+                    extra={**entry, "partition": key[0], "body": key[1]},
                 )
                 continue
 
@@ -403,31 +442,150 @@ class WrcSpider(scrapy.Spider):
                 "doc_url": urljoin(response.url, href),
             }
 
+    def _embedded_decision_pdf(
+        self, response: Response, identifier: str
+    ) -> Optional[str]:
+        """Return the absolute URL of a legacy decision PDF embedded in an HTML
+        case page, or None.
+
+        A link qualifies when its filename contains the record identifier (e.g.
+        Equality's ``DEC-E2000-14.pdf``) or it sits under a known legacy import
+        path (e.g. EAT's GUID-named PDFs under ``/eat_import/``). Site-chrome
+        PDFs (cookie policy, info guides) are excluded. The first match wins.
+        """
+        norm_id = _norm(identifier)
+        for href in response.css("a::attr(href)").getall():
+            if not href:
+                continue
+            low = href.lower()
+            if not urlparse(low).path.endswith(".pdf"):
+                continue
+            if any(chrome in low for chrome in self.pdf_exclude):
+                continue
+            if norm_id and norm_id in _norm(urlparse(low).path):
+                return urljoin(response.url, href)
+            if any(marker in low for marker in self.pdf_path_markers):
+                return urljoin(response.url, href)
+        return None
+
     # ------------------------------------------------------------------ #
     # Step 3: download the document itself
     # ------------------------------------------------------------------ #
     def parse_document(self, response: Response):
         item: WrcDocumentItem = response.meta["item"]
-        content_type = (
-            response.headers.get("Content-Type", b"").decode("latin-1").lower()
-        )
-        ext = response.meta.get("ext_hint")
-        if not ext:
-            if "pdf" in content_type:
-                ext = "pdf"
-            elif "msword" in content_type or "officedocument" in content_type:
-                ext = "docx" if "officedocument" in content_type else "doc"
-            else:
-                ext = "html"
 
-        item["file_content"] = response.body
-        item["file_ext"] = ext
-        item["content_type"] = content_type
+        # A callback that raises here is only logged to Scrapy's
+        # `spider_exceptions` stat and never reaches errback, so the record would
+        # vanish from run_stats (neither scraped nor failed). Wrap the body so any
+        # unexpected error becomes an auditable document failure instead.
+        try:
+            content_type = (
+                (response.headers.get("Content-Type") or b"").decode("latin-1").lower()
+            )
+            ext = response.meta.get("ext_hint")
+            if not ext:
+                if "pdf" in content_type:
+                    ext = "pdf"
+                elif "msword" in content_type or "officedocument" in content_type:
+                    ext = "docx" if "officedocument" in content_type else "doc"
+                else:
+                    ext = "html"
+
+            # For a legacy case page the decision is a PDF embedded in the HTML
+            # wrapper, not the wrapper itself. Follow that PDF and store it as
+            # the authoritative artifact; the wrapper is only an index. Guarded
+            # by `pdf_followed` so the fetched PDF (ext=pdf) is never re-scanned.
+            if (
+                ext == "html"
+                and self.cfg.follow_embedded_pdf
+                and not response.meta.get("pdf_followed")
+            ):
+                pdf_url = self._embedded_decision_pdf(response, item["identifier"])
+                if pdf_url:
+                    self.logger.info(
+                        "following embedded decision PDF",
+                        extra={
+                            "identifier": item["identifier"],
+                            "pdf_url": pdf_url,
+                            **_ctx(response.meta),
+                        },
+                    )
+                    yield scrapy.Request(
+                        pdf_url,
+                        callback=self.parse_document,
+                        errback=self.on_document_failed,
+                        meta={
+                            "item": item,
+                            "ext_hint": "pdf",
+                            "pdf_followed": True,
+                            **_ctx(response.meta),
+                        },
+                        dont_filter=False,
+                    )
+                    # The follow-up PDF request produces this record's terminal
+                    # state; the wrapper contributes neither scraped nor failed.
+                    return
+
+            body = response.body
+
+            # Don't trust the URL extension / Content-Type alone: a 200 response
+            # can still be the wrong payload (e.g. a `.pdf` link that returns an
+            # HTML "not found" interstitial). Verify the bytes match the expected
+            # type via magic bytes; a mismatch is recorded as an auditable failure
+            # rather than being stored under a lying extension.
+            if not _content_matches_ext(ext, body):
+                self._record_document_failure(
+                    response,
+                    item,
+                    stage="validation",
+                    error=(
+                        f"downloaded content does not match expected type {ext!r} "
+                        "(magic-byte mismatch)"
+                    ),
+                )
+                return
+
+            item["file_content"] = body
+            item["file_ext"] = ext
+            item["content_type"] = content_type
+        except Exception as exc:  # noqa: BLE001 - keep the record auditable
+            self._record_document_failure(
+                response,
+                item,
+                stage="parse",
+                error=f"unhandled exception parsing document: {exc!r}",
+            )
+            return
 
         # NOTE: "scraped" is NOT incremented here. Success is counted by
         # MongoMetadataPipeline once the document is fully persisted, so a
         # failure in hashing/storage/metadata never masquerades as a success.
         yield item
+
+    def _record_document_failure(
+        self,
+        response: Response,
+        item: "WrcDocumentItem",
+        *,
+        stage: str,
+        error: str,
+    ) -> None:
+        """Record a document that downloaded (HTTP-wise) but is unusable, so it
+        still ends in exactly one auditable state: found = scraped + failed."""
+        meta = response.meta
+        key = (meta.get("partition_label", "?"), meta.get("body", "?"))
+        entry = {
+            "url": response.url,
+            "identifier": item.get("identifier"),
+            "status": response.status,
+            "stage": stage,
+            "error": error,
+        }
+        self.run_stats[key]["failed"].append(entry)
+        self.logger.error(
+            "document validation failed",
+            extra={**entry, "partition": key[0], "body": key[1]},
+        )
 
     # ------------------------------------------------------------------ #
     # Error handling
@@ -502,32 +660,6 @@ class WrcSpider(scrapy.Spider):
     # ------------------------------------------------------------------ #
     # Pipeline-stage failure accounting (item_error / item_dropped)
     # ------------------------------------------------------------------ #
-    def _on_item_error(self, item, response, spider, failure):
-        """A pipeline raised while processing an item."""
-        self._record_item_failure(item, error=repr(failure.value))
-
-    def _on_item_dropped(self, item, response, exception, spider):
-        """A pipeline dropped an item via DropItem."""
-        self._record_item_failure(item, error=str(exception))
-
-    def _record_item_failure(self, item, error: str) -> None:
-        adapter = ItemAdapter(item)
-        key = (
-            adapter.get("partition_label") or "?",
-            adapter.get("body") or "?",
-        )
-        entry = {
-            "url": adapter.get("doc_url"),
-            "identifier": adapter.get("identifier"),
-            "error": error,
-            "status": None,
-            "stage": "pipeline",
-        }
-        self.run_stats[key]["failed"].append(entry)
-        self.logger.error(
-            "item processing failed",
-            extra={**entry, "partition": key[0], "body": key[1]},
-        )
     def _item_failure_context(self, item):
         adapter = ItemAdapter(item)
 
@@ -537,7 +669,6 @@ class WrcSpider(scrapy.Spider):
         )
 
         return adapter, key
-
 
     def _on_item_error(
         self,
@@ -558,10 +689,7 @@ class WrcSpider(scrapy.Spider):
 
         entry = {
             "identifier": adapter.get("identifier"),
-            "url": (
-                adapter.get("doc_url")
-                or getattr(response, "url", None)
-            ),
+            "url": (adapter.get("doc_url") or getattr(response, "url", None)),
             "status": getattr(response, "status", None),
             "stage": "pipeline",
             "error_type": error_type,
@@ -579,7 +707,6 @@ class WrcSpider(scrapy.Spider):
             },
         )
 
-
     def _on_item_dropped(
         self,
         item,
@@ -593,10 +720,7 @@ class WrcSpider(scrapy.Spider):
 
         entry = {
             "identifier": adapter.get("identifier"),
-            "url": (
-                adapter.get("doc_url")
-                or getattr(response, "url", None)
-            ),
+            "url": (adapter.get("doc_url") or getattr(response, "url", None)),
             "status": getattr(response, "status", None),
             "stage": "pipeline",
             "error_type": type(exception).__name__,
@@ -613,66 +737,95 @@ class WrcSpider(scrapy.Spider):
                 "body": key[1],
             },
         )
+
     # ------------------------------------------------------------------ #
     # Step 4: end-of-run summary
     # ------------------------------------------------------------------ #
-    def closed(self, reason: str) -> None:
-        """Build, log, and persist the final run summary."""
+    def _reconcile_partition(self, partition: str, body: str, stats: Dict) -> Dict:
+        """Turn one (partition, body)'s raw counters into an auditable summary.
 
-        partition_summaries = []
+        Pure: no logging or I/O, so the reconciliation invariant can be unit
+        tested directly. Every discovered record must land in exactly one bucket.
+        """
+        document_failures = stats["failed"]
+        parse_failures = stats["parse_failures"]
+        listing_failures = stats["listing_failures"]
 
-        for (partition, body), stats in sorted(self.run_stats.items()):
-            document_failures = stats["failed"]
-            listing_failures = stats["listing_failures"]
+        known_listing_losses = sum(
+            failure.get("records_at_risk") or 0 for failure in listing_failures
+        )
 
-            known_listing_losses = sum(
-                failure.get("records_at_risk") or 0
-                for failure in listing_failures
-            )
+        unknown_listing_loss = any(
+            failure.get("records_at_risk") is None for failure in listing_failures
+        )
 
-            unknown_listing_loss = any(
-                failure.get("records_at_risk") is None
-                for failure in listing_failures
-            )
+        # Document requests we enqueued but that never reached a terminal state
+        # (scraped, unchanged-counted-as-scraped, or a recorded failure). A
+        # positive value is a silent loss — e.g. a request dropped by the
+        # dupefilter/at shutdown, or a callback exception that never surfaced —
+        # and is reported so it can never quietly shrink the scraped count.
+        doc_unaccounted = max(
+            stats["docs_enqueued"] - stats["scraped"] - len(document_failures),
+            0,
+        )
 
-            accounted_records = (
-                stats["scraped"]
-                + len(document_failures)
-                + known_listing_losses
-            )
+        # Every discovered record must land in exactly one auditable bucket:
+        # scraped (incl. unchanged) + document failures + unusable listing cards
+        # + intentionally-skipped + records lost on failed listing pages +
+        # silently-lost document requests.
+        accounted_records = (
+            stats["scraped"]
+            + len(document_failures)
+            + len(parse_failures)
+            + stats["skipped"]
+            + known_listing_losses
+            + doc_unaccounted
+        )
 
-            reconciled = (
-                stats["found"] is not None
-                and not unknown_listing_loss
-                and accounted_records == stats["found"]
-            )
+        reconciled = (
+            stats["found"] is not None
+            and not unknown_listing_loss
+            and accounted_records == stats["found"]
+        )
 
-            complete = (
-                reconciled
-                and not document_failures
-                and not listing_failures
-                and not stats["count_parse_failed"]
-            )
+        complete = (
+            reconciled
+            and not document_failures
+            and not parse_failures
+            and not listing_failures
+            and not doc_unaccounted
+            and not stats["count_parse_failed"]
+        )
 
-            partition_summaries.append(
-                {
-                    "partition": partition,
-                    "body": body,
-                    "records_found": stats["found"],
-                    "records_scraped": stats["scraped"],
-                    "records_unchanged": stats["unchanged"],
-                    "records_failed": len(document_failures),
-                    "failures": document_failures,
-                    "listing_failures": listing_failures,
-                    "records_listing_at_risk": known_listing_losses,
-                    "count_parse_failed": stats["count_parse_failed"],
-                    "records_accounted": accounted_records,
-                    "reconciled": reconciled,
-                    "complete": complete,
-                }
-            )
+        return {
+            "partition": partition,
+            "body": body,
+            "records_found": stats["found"],
+            "records_scraped": stats["scraped"],
+            "records_unchanged": stats["unchanged"],
+            "records_failed": len(document_failures),
+            "failures": document_failures,
+            "records_parse_failed": len(parse_failures),
+            "parse_failures": parse_failures,
+            "records_skipped": stats["skipped"],
+            "docs_enqueued": stats["docs_enqueued"],
+            "records_unaccounted": doc_unaccounted,
+            "listing_failures": listing_failures,
+            "records_listing_at_risk": known_listing_losses,
+            "count_parse_failed": stats["count_parse_failed"],
+            "records_accounted": accounted_records,
+            "reconciled": reconciled,
+            "complete": complete,
+        }
 
-        summary = {
+    def _build_summary(self, reason: str) -> Dict:
+        """Assemble the full run summary from run_stats. Pure (no I/O)."""
+        partition_summaries = [
+            self._reconcile_partition(partition, body, stats)
+            for (partition, body), stats in sorted(self.run_stats.items())
+        ]
+
+        return {
             "spider": self.name,
             "run_id": self.run_id,
             "reason": reason,
@@ -681,25 +834,23 @@ class WrcSpider(scrapy.Spider):
             "partition_size": self.partition_size,
             "partitions": partition_summaries,
             "totals": {
-                "found": sum(
-                    stats["found"] or 0
-                    for stats in self.run_stats.values()
-                ),
-                "scraped": sum(
-                    stats["scraped"]
-                    for stats in self.run_stats.values()
-                ),
+                "found": sum(stats["found"] or 0 for stats in self.run_stats.values()),
+                "scraped": sum(stats["scraped"] for stats in self.run_stats.values()),
                 "unchanged": sum(
-                    stats["unchanged"]
-                    for stats in self.run_stats.values()
+                    stats["unchanged"] for stats in self.run_stats.values()
                 ),
                 "failed": sum(
-                    len(stats["failed"])
-                    for stats in self.run_stats.values()
+                    len(stats["failed"]) for stats in self.run_stats.values()
+                ),
+                "parse_failed": sum(
+                    len(stats["parse_failures"]) for stats in self.run_stats.values()
+                ),
+                "skipped": sum(stats["skipped"] for stats in self.run_stats.values()),
+                "unaccounted": sum(
+                    summary["records_unaccounted"] for summary in partition_summaries
                 ),
                 "listing_failures": sum(
-                    len(stats["listing_failures"])
-                    for stats in self.run_stats.values()
+                    len(stats["listing_failures"]) for stats in self.run_stats.values()
                 ),
                 "records_listing_at_risk": sum(
                     failure.get("records_at_risk") or 0
@@ -720,6 +871,27 @@ class WrcSpider(scrapy.Spider):
             "finished_at": datetime.now(timezone.utc).isoformat(),
         }
 
+    def closed(self, reason: str) -> None:
+        """Build, log, and persist the final run summary."""
+
+        summary = self._build_summary(reason)
+
+        # Escalate any silent document losses so they are visible in logs, not
+        # only in the persisted summary.
+        for partition_summary in summary["partitions"]:
+            if partition_summary["records_unaccounted"]:
+                self.logger.error(
+                    "document requests unaccounted for; possible silent loss",
+                    extra={
+                        "partition": partition_summary["partition"],
+                        "body": partition_summary["body"],
+                        "docs_enqueued": partition_summary["docs_enqueued"],
+                        "records_scraped": partition_summary["records_scraped"],
+                        "records_failed": partition_summary["records_failed"],
+                        "records_unaccounted": partition_summary["records_unaccounted"],
+                    },
+                )
+
         self.logger.info(
             "run summary",
             extra={"summary": summary},
@@ -728,18 +900,12 @@ class WrcSpider(scrapy.Spider):
         try:
             client = get_mongo_client(self.cfg)
 
-            run_logs = client[
-                self.cfg.mongo_db
-            ][
-                self.cfg.mongo_run_log_collection
-            ]
+            run_logs = client[self.cfg.mongo_db][self.cfg.mongo_run_log_collection]
 
             run_logs.create_index([("finished_at", -1)])
             run_logs.create_index([("run_id", 1)])
 
-            run_logs.insert_one(
-                json.loads(json.dumps(summary))
-            )
+            run_logs.insert_one(json.loads(json.dumps(summary)))
 
             client.close()
 
@@ -748,6 +914,8 @@ class WrcSpider(scrapy.Spider):
                 "could not persist run summary",
                 extra={"error": str(exc)},
             )
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
@@ -757,6 +925,40 @@ def _url_extension(url: str) -> Optional[str]:
         if path.endswith(f".{ext}"):
             return ext
     return None
+
+
+def _norm(value: str) -> str:
+    """Lowercase and strip all non-alphanumerics, so an identifier can be
+    matched inside a filename regardless of separators/case
+    (``DEC-E2000-14`` -> ``dece200014`` matches ``dec-e2000-14.pdf``)."""
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+# Leading "magic bytes" for the binary types we store verbatim. HTML (and any
+# other/unknown ext) has no reliable signature, so it is not signature-checked.
+_DOCUMENT_MAGIC: Dict[str, Tuple[bytes, ...]] = {
+    "docx": (b"PK\x03\x04",),  # OOXML is a zip container
+    "doc": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",),  # OLE2 compound file
+    "rtf": (b"{\\rtf",),
+}
+
+
+def _content_matches_ext(ext: Optional[str], content: bytes) -> bool:
+    """True if ``content`` plausibly matches ``ext`` by its magic bytes.
+
+    PDFs are matched leniently (``%PDF`` anywhere in the first 1 KiB, as some
+    files carry a short preamble); other binaries must start with their exact
+    signature. HTML and unknown extensions have no signature and always pass —
+    HTML content is validated later by the canonicalizer's text-length gate.
+    """
+    if ext == "pdf":
+        return b"%PDF" in content[:1024]
+
+    signatures = _DOCUMENT_MAGIC.get(ext or "")
+    if signatures is None:
+        return True
+
+    return any(content.startswith(signature) for signature in signatures)
 
 
 def _ctx(meta: dict) -> dict:

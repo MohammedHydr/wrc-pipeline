@@ -180,9 +180,7 @@ def test_canonical_html_strips_boilerplate_and_keeps_content() -> None:
 def test_canonical_html_falls_back_to_body() -> None:
     raw = (
         b"<html><head><title>Fallback</title></head><body>"
-        b"<p>"
-        + b"fallback decision content " * 40
-        + b"</p></body></html>"
+        b"<p>" + b"fallback decision content " * 40 + b"</p></body></html>"
     )
 
     result = canonicalize_html(

@@ -5,7 +5,9 @@ from datetime import date
 
 from scrapy.http import HtmlResponse, Request
 
+from scraper.wrc_scraper.items import WrcDocumentItem
 from scraper.wrc_scraper.spiders import WrcSpider
+from scraper.wrc_scraper.spiders import wrc_spider as wrc_spider_mod
 
 # Two result cards + the count line, mirroring the exact live markup observed
 # via `scrapy shell` (li.each-item / span.refNO / h2.title a / span.date /
@@ -101,12 +103,233 @@ def test_extract_records_skips_card_without_identifier():
     assert list(_spider()._extract_records(resp)) == []
 
 
+def test_extract_records_records_malformed_card_as_parse_failure():
+    # A card with no ref number cannot become a document identity, but it still
+    # counts toward the site's total; it must be recorded, not silently dropped.
+    html = (
+        "<html><body><li class='each-item'>"
+        "<h2 class='title'><a href='/en/cases/x.html'>X</a></h2>"
+        "</li></body></html>"
+    )
+    request = Request(
+        SEARCH_URL,
+        meta={"partition_label": "2024-01-01_2024-01-31", "body": "Labour Court"},
+    )
+    resp = HtmlResponse(
+        url=SEARCH_URL, body=html.encode(), encoding="utf-8", request=request
+    )
+    spider = _spider()
+    records = list(spider._extract_records(resp))
+
+    assert records == []
+    key = ("2024-01-01_2024-01-31", "Labour Court")
+    parse_failures = spider.run_stats[key]["parse_failures"]
+    assert len(parse_failures) == 1
+    assert parse_failures[0]["stage"] == "listing_parse"
+    assert parse_failures[0]["identifier"] is None
+
+
 def test_search_url_uses_config_and_literal_date_slashes():
     url = _spider()._search_url(date(2024, 1, 1), date(2024, 1, 31), "3", 2)
     assert url == (
         "https://www.workplacerelations.ie/en/search/"
         "?decisions=1&from=01/01/2024&to=31/01/2024&body=3&pageNumber=2"
     )
+
+
+def _stats(**overrides):
+    """A run_stats entry with all buckets zeroed, then overridden."""
+    base = {
+        "found": None,
+        "scraped": 0,
+        "unchanged": 0,
+        "failed": [],
+        "parse_failures": [],
+        "skipped": 0,
+        "docs_enqueued": 0,
+        "listing_failures": [],
+        "count_parse_failed": False,
+    }
+    base.update(overrides)
+    return base
+
+
+def _summary_for(**stats):
+    spider = _spider()
+    spider.run_stats[("2022-04-01_2022-04-30", "Workplace Relations Commission")] = (
+        _stats(**stats)
+    )
+    return spider._build_summary("finished")["partitions"][0]
+
+
+def test_clean_partition_reconciles_and_completes():
+    p = _summary_for(found=2, scraped=2, docs_enqueued=2)
+    assert p["reconciled"] and p["complete"]
+    assert p["records_accounted"] == 2
+    assert p["records_unaccounted"] == 0
+
+
+def test_malformed_card_reconciles_but_is_incomplete():
+    # December 2022 signature: a listing card with no identifier/link.
+    p = _summary_for(
+        found=3,
+        scraped=2,
+        docs_enqueued=2,
+        parse_failures=[{"stage": "listing_parse", "error": "missing id"}],
+    )
+    assert p["reconciled"]  # 2 scraped + 1 parse_failure == 3 found
+    assert not p["complete"]  # but not clean
+    assert p["records_parse_failed"] == 1
+    assert p["records_unaccounted"] == 0
+
+
+def test_silent_document_loss_is_surfaced_as_unaccounted():
+    # April 2022 signature: a well-formed record enqueued for download that
+    # never reached a terminal state (no scrape, no recorded failure).
+    p = _summary_for(found=3, scraped=2, docs_enqueued=3)
+    assert p["records_unaccounted"] == 1
+    assert p["reconciled"]  # the gap is now explicitly accounted
+    assert not p["complete"]
+
+
+def test_fast_mode_skip_keeps_partition_reconciled():
+    p = _summary_for(found=5, scraped=3, docs_enqueued=3, skipped=2)
+    assert p["reconciled"]
+    assert p["records_skipped"] == 2
+
+
+def test_unexplained_shortfall_fails_reconciliation():
+    # A record lost before it was ever enqueued (not skipped, not a parse
+    # failure) leaves the denominator short and must NOT reconcile.
+    p = _summary_for(found=3, scraped=2, docs_enqueued=2)
+    assert not p["reconciled"]
+    assert p["records_accounted"] == 2
+
+
+def _document_response(ext_hint, body, identifier="ADJ-1", url="http://x/y"):
+    key = ("2022-04-01_2022-04-30", "Workplace Relations Commission")
+    item = WrcDocumentItem(
+        identifier=identifier, body=key[1], partition_label=key[0], doc_url=url
+    )
+    request = Request(
+        url,
+        meta={
+            "item": item,
+            "ext_hint": ext_hint,
+            "partition_label": key[0],
+            "body": key[1],
+        },
+    )
+    return key, HtmlResponse(url=url, body=body, request=request, encoding="utf-8")
+
+
+# Legacy case pages: an HTML wrapper that links to the authoritative decision
+# PDF, plus the two site-chrome PDFs present on every page.
+EQUALITY_CASE_HTML = b"""
+<html><body>
+  <a href="/en/privacy-policy/cookie_policy.pdf">Cookie policy</a>
+  <a href="/en/Publications_Forms/Decisions_Information_Guide.pdf">Guide</a>
+  <a href="/en/Equality_Tribunal_Import/Database-of-Decisions/2000/DEC-E2000-14.pdf">
+     Download the decision</a>
+</body></html>
+"""
+
+EAT_CASE_HTML = b"""
+<html><body>
+  <a href="/en/privacy-policy/cookie_policy.pdf">Cookie policy</a>
+  <a href="/en/eat_import/2008/12/674e1a97-d24e-4513-b48d-ad46343febb5.pdf">Download</a>
+</body></html>
+"""
+
+MODERN_CASE_HTML = b"""
+<html><body>
+  <a href="/en/privacy-policy/cookie_policy.pdf">Cookie policy</a>
+  <h1>ADJ-00036994</h1><p>Full decision text lives here in HTML.</p>
+</body></html>
+"""
+
+
+def test_embedded_pdf_matches_identifier_and_skips_chrome():
+    spider = _spider()
+    _, resp = _document_response(None, EQUALITY_CASE_HTML, identifier="DEC-E2000-14")
+    url = spider._embedded_decision_pdf(resp, "DEC-E2000-14")
+    assert url.endswith("/Database-of-Decisions/2000/DEC-E2000-14.pdf")
+
+
+def test_embedded_pdf_matches_legacy_import_path_for_guid_named_file():
+    spider = _spider()
+    _, resp = _document_response(None, EAT_CASE_HTML, identifier="31482")
+    url = spider._embedded_decision_pdf(resp, "31482")
+    assert url.endswith("/eat_import/2008/12/674e1a97-d24e-4513-b48d-ad46343febb5.pdf")
+
+
+def test_embedded_pdf_returns_none_for_modern_html_only_page():
+    spider = _spider()
+    _, resp = _document_response(None, MODERN_CASE_HTML, identifier="ADJ-00036994")
+    assert spider._embedded_decision_pdf(resp, "ADJ-00036994") is None
+
+
+def test_parse_document_follows_embedded_pdf_instead_of_storing_wrapper():
+    spider = _spider()
+    _, resp = _document_response(None, EQUALITY_CASE_HTML, identifier="DEC-E2000-14")
+    out = list(spider.parse_document(resp))
+    # One follow-up request to the PDF, and NO item for the HTML wrapper.
+    assert len(out) == 1
+    req = out[0]
+    assert isinstance(req, Request)
+    assert req.url.endswith("/DEC-E2000-14.pdf")
+    assert req.meta["ext_hint"] == "pdf"
+    assert req.meta["pdf_followed"] is True
+    assert req.meta["item"]["identifier"] == "DEC-E2000-14"
+
+
+def test_parse_document_stores_html_when_no_embedded_pdf():
+    spider = _spider()
+    _, resp = _document_response(None, MODERN_CASE_HTML, identifier="ADJ-00036994")
+    out = list(spider.parse_document(resp))
+    assert len(out) == 1
+    assert out[0]["file_ext"] == "html"
+    assert out[0]["file_content"] == MODERN_CASE_HTML
+
+
+def test_parse_document_stores_followed_pdf_bytes():
+    spider = _spider()
+    # The followed PDF response carries pdf_followed=True so it is not re-scanned.
+    _, resp = _document_response(
+        "pdf", b"%PDF-1.7\nlegacy decision\n%%EOF", identifier="DEC-E2000-14"
+    )
+    resp.meta["pdf_followed"] = True
+    out = list(spider.parse_document(resp))
+    assert len(out) == 1
+    assert out[0]["file_ext"] == "pdf"
+    assert out[0]["file_content"].startswith(b"%PDF")
+
+
+def test_parse_document_validation_mismatch_is_recorded():
+    spider = _spider()
+    key, response = _document_response("pdf", b"not a pdf at all")
+    assert list(spider.parse_document(response)) == []
+    failures = spider.run_stats[key]["failed"]
+    assert len(failures) == 1
+    assert failures[0]["stage"] == "validation"
+
+
+def test_parse_document_unhandled_exception_is_recorded_not_silent(monkeypatch):
+    # An exception in the callback would otherwise only hit Scrapy's
+    # spider_exceptions stat and vanish from run_stats. It must become a
+    # recorded document failure so the record stays auditable.
+    spider = _spider()
+    key, response = _document_response("html", b"<html>ok</html>")
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(wrc_spider_mod, "_content_matches_ext", boom)
+    assert list(spider.parse_document(response)) == []
+    failures = spider.run_stats[key]["failed"]
+    assert len(failures) == 1
+    assert failures[0]["stage"] == "parse"
+    assert "kaboom" in failures[0]["error"]
 
 
 def test_body_code_map_parses_configured_pairs():

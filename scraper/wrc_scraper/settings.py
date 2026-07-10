@@ -13,6 +13,7 @@ getting blocked" is:
 * HTTP compression + DNS cache to cut per-request overhead.
 * robots.txt respected by default (configurable).
 """
+
 from config.settings import get_settings
 
 _cfg = get_settings()
@@ -44,6 +45,15 @@ RETRY_HTTP_CODES = [429, 500, 502, 503, 504, 522, 524, 408]
 
 COMPRESSION_ENABLED = True
 DNSCACHE_ENABLED = True
+
+# The WRC flow is stateless GET, so the cookie middleware is unnecessary
+# overhead (and avoids storing volatile tracking cookies). See recon notes.
+COOKIES_ENABLED = _cfg.cookies_enabled
+
+# Memory guard for buffered document downloads. Exceeding the max cancels the
+# download (recorded as an auditable failure via the errback); warnsize logs.
+DOWNLOAD_MAXSIZE = _cfg.download_maxsize
+DOWNLOAD_WARNSIZE = _cfg.download_warnsize
 
 # Optional local HTTP cache — useful during development to avoid re-hitting
 # the site while iterating on selectors.

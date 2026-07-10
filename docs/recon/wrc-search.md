@@ -72,10 +72,33 @@ Each result is a `<li class="each-item">`:
 
 ## Documents
 
-View-Page links go to case pages at `/en/cases/YYYY/month/<ref>.html` — the
-decision is rendered as HTML on that page, so it's stored as `.html` (the
-transform later strips boilerplate). Any link ending in `.pdf/.doc/.docx/.rtf`
-is stored byte-for-byte instead.
+View-Page links go to case pages at `/en/cases/YYYY/month/<ref>.html`. **Every
+search result, for every body and year (measured 2000–2022), links to an HTML
+case page** — the listing never emits a `.pdf/.doc` `doc_url`. So a run that
+stores only HTML for a modern range is expected, not a bug. (Any listing link
+that *did* end in `.pdf/.doc/.docx/.rtf` would still be stored byte-for-byte.)
+
+### Where the PDFs actually are (measured)
+
+The authoritative decision PDF exists only in the **earliest legacy imports**,
+embedded *inside* the HTML case page (not in the listing):
+
+| Body / era | Case page embeds a decision PDF? | PDF URL pattern |
+|------------|----------------------------------|-----------------|
+| Equality Tribunal ~2000–2003 | ✅ | `/en/Equality_Tribunal_Import/Database-of-Decisions/YYYY/DEC-*.pdf` |
+| Employment Appeals Tribunal (legacy) | ✅ | `/en/eat_import/YYYY/MM/<guid>.pdf` |
+| Equality/EAT ~2010+, Labour Court, WRC (all years) | ❌ HTML-only | — |
+
+Two PDFs appear as chrome on *every* page and are **not** decisions:
+`.../privacy-policy/cookie_policy.pdf` and
+`.../publications_forms/decisions_information_guide.pdf`.
+
+The spider therefore fetches the HTML case page and, when
+`FOLLOW_EMBEDDED_PDF` is set (default), follows the embedded decision PDF
+(`_embedded_decision_pdf()`: identifier-matched, or under an `_import/` /
+`database-of-decisions` path; chrome PDFs excluded) and stores that PDF
+byte-for-byte as the artifact for the record. Modern HTML-only pages are stored
+as `.html` and cleaned by the transform.
 
 
 ## Official search guide

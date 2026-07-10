@@ -15,8 +15,8 @@ import uuid
 from datetime import date, datetime, timedelta
 from typing import Iterator, Optional, Tuple
 
-import boto3
-from botocore.config import Config as BotoConfig
+import boto3  # type: ignore[import-untyped]
+from botocore.config import Config as BotoConfig  # type: ignore[import-untyped]
 from pymongo import MongoClient
 from pythonjsonlogger import json as jsonlogger
 from config.settings import Settings
