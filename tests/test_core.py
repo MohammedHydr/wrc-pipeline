@@ -253,3 +253,26 @@ def test_canonical_html_is_stable_when_page_chrome_changes() -> None:
     assert sha256_bytes(first_result.content_bytes) == sha256_bytes(
         second_result.content_bytes
     )
+
+
+def test_spooled_copy_streams_hashes_and_counts():
+    import hashlib
+
+    from transform.transform import _spooled_copy
+
+    class FakeBody:
+        """Mimics botocore StreamingBody.iter_chunks."""
+
+        def __init__(self, data: bytes, chunk: int = 7):
+            self._data, self._chunk = data, chunk
+
+        def iter_chunks(self, _size):
+            for i in range(0, len(self._data), self._chunk):
+                yield self._data[i : i + self._chunk]
+
+    data = b"%PDF-1.7 " + b"x" * 1000 + b" %%EOF"
+    with _spooled_copy(FakeBody(data)) as (spool, digest, size):
+        assert digest == hashlib.sha256(data).hexdigest()
+        assert size == len(data)
+        spool.seek(0)
+        assert spool.read() == data

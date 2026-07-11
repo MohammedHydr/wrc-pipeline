@@ -395,3 +395,76 @@ def test_document_failure_without_fallback_payload_is_recorded():
     assert len(failures) == 1
     assert failures[0]["identifier"] == "ADJ-1"
     assert "504" in failures[0]["error"]
+
+
+# --------------------------------------------------------------------------- #
+# Conditional re-fetches (If-None-Match / 304)
+# --------------------------------------------------------------------------- #
+def test_conditional_headers_require_exact_url_match():
+    spider = _spider()
+    key = (spider.source, "Equality Tribunal", "DEC-E2000-14")
+    spider.validators[key] = ("635084655247730000", "http://x/decision.pdf")
+    # ETag observed on this exact URL -> header attached.
+    assert spider._conditional_headers(key, "http://x/decision.pdf") == {
+        "If-None-Match": "635084655247730000"
+    }
+    # The ETag belongs to the embedded PDF, not the HTML case page.
+    assert spider._conditional_headers(key, "http://x/case.html") is None
+    # Unknown record -> no header.
+    other = (spider.source, "Equality Tribunal", "OTHER")
+    assert spider._conditional_headers(other, "http://x/decision.pdf") is None
+
+
+def test_parse_document_304_yields_not_modified_item():
+    from scrapy.http import Response
+
+    spider = _spider()
+    key = ("2000-01-01_2000-01-31", "Equality Tribunal")
+    item = WrcDocumentItem(
+        identifier="DEC-E2000-14", body=key[1], partition_label=key[0]
+    )
+    request = Request(
+        "http://x/decision.pdf",
+        meta={"item": item, "partition_label": key[0], "body": key[1]},
+    )
+    resp = Response("http://x/decision.pdf", status=304, request=request, body=b"")
+    out = list(spider.parse_document(resp))
+    assert len(out) == 1
+    assert out[0]["not_modified"] is True
+    # No body was sent, so no content/failure may be recorded.
+    assert out[0].get("file_content") is None
+    assert spider.run_stats[key]["failed"] == []
+
+
+def test_hash_pipeline_resolves_304_item_from_state(monkeypatch):
+    from types import SimpleNamespace
+
+    from scraper.wrc_scraper import pipelines as pl
+
+    state_doc = {
+        "latest_file_hash": "f" * 64,
+        "latest_content_hash": "c" * 64,
+        "latest_file_path": "s3://wrc-landing/body=b/partition=p/id/f.pdf",
+        "latest_size_bytes": 27092,
+        "latest_file_ext": "pdf",
+        "latest_content_type": "application/pdf",
+    }
+    pipeline = pl.HashAndDedupPipeline()
+    pipeline.state = SimpleNamespace(find_one=lambda q: state_doc)
+    # Execute the marshalled counter inline instead of via the reactor.
+    monkeypatch.setattr(pl.reactor, "callFromThread", lambda fn, *args: fn(*args))
+
+    spider = _spider()
+    key = ("2000-01-01_2000-01-31", "Equality Tribunal")
+    item = WrcDocumentItem(
+        identifier="DEC-E2000-14",
+        body=key[1],
+        partition_label=key[0],
+        source="www.workplacerelations.ie",
+        not_modified=True,
+    )
+    out = pipeline._process(item, spider)
+    assert out["unchanged"] is True
+    assert out["file_hash"] == "f" * 64
+    assert out["file_path"].endswith("/f.pdf")
+    assert spider.run_stats[key]["unchanged"] == 1

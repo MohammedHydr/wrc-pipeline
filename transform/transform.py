@@ -1,23 +1,9 @@
-"""Landing-zone -> curated-zone transformation.
+"""Landing -> curated transformation.
 
-Given a start and end date (matched against `partition_date`):
-
-1. fetch metadata records from the Mongo landing collection,
-2. download each referenced file from the landing bucket,
-3. transform:
-     * pdf/doc/docx/rtf  -> passed through unchanged,
-     * html              -> reduced to the relevant content only
-                            (navigation, headers, footers, scripts, forms
-                            stripped) and re-hashed,
-4. rename EVERY file to `<identifier>.<ext>`,
-5. upload to the curated bucket,
-6. upsert the curated metadata record (new file_path + file_hash) into a
-   separate Mongo collection.
-
-The landing zone is never modified. The step is idempotent: curated records
-are keyed on `identifier` and re-uploading identical bytes to the same key is
-a no-op; if the source hash has not changed since the last transformation,
-the record is skipped entirely.
+Fetches landing metadata for a date range, cleans HTML down to the decision
+content (binaries pass through), renames every file to <identifier>.<ext>,
+and writes objects + metadata to the curated bucket/collection. Landing is
+never modified; reruns skip records whose source hash hasn't changed.
 
 Usage:
     python -m transform.transform --start-date 2024-01-01 --end-date 2024-06-30
@@ -26,10 +12,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import IO, Any, Iterator
 
 from pymongo import ASCENDING
 
@@ -51,15 +40,10 @@ logger = logging.getLogger("transform")
 
 PASSTHROUGH_EXTS = {"pdf", "doc", "docx", "rtf"}
 
-# Bump when the HTML-cleaning logic or curated naming changes: records
-# transformed with an older parser version are re-transformed on the next run
-# (landing stays untouched; superseded curated objects are cleaned up).
+# Bump on cleaner/naming changes: stale curated records re-derive next run.
 PARSER_VERSION = "1.2"
 
 
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
 def run_transformation(
     start_date: str,
     end_date: str,
@@ -83,8 +67,6 @@ def run_transformation(
     state = database[cfg.mongo_state_collection]
     curated = database[cfg.mongo_curated_collection]
 
-    # Same natural key as landing: one curated record per (source, body,
-    # identifier). partition_date supports downstream date-range queries.
     curated.create_index(
         [("source", ASCENDING), ("body", ASCENDING), ("identifier", ASCENDING)],
         unique=True,
@@ -104,18 +86,12 @@ def run_transformation(
         "failed": [],
     }
 
-    # Materialize the cursor before fanning out: a Mongo cursor is not safe to
-    # iterate from multiple threads, whereas the MongoClient itself is. State
-    # records are small metadata documents, so holding the selection in memory
-    # is cheap.
+    # Mongo cursors aren't thread-safe; the records are small, so materialize.
     records = list(state.find(query))
     stats["selected"] = len(records)
 
-    # The step is I/O-bound (S3 GET/PUT + Mongo per record); worker threads
-    # overlap that latency. pymongo and botocore low-level clients are both
-    # thread-safe, so the same `s3` / collection handles are shared across
-    # workers. Each record upserts its own (source, body, identifier) key, so
-    # results stay idempotent regardless of completion order.
+    # I/O-bound work — threads overlap the S3/Mongo latency. Clients are
+    # thread-safe, and each record upserts its own key, so order is irrelevant.
     with ThreadPoolExecutor(max_workers=cfg.transform_workers) as executor:
         futures = [
             executor.submit(
@@ -156,13 +132,8 @@ def _process_record(
     cfg,
     run_id: str,
 ) -> dict[str, Any]:
-    """Transform one landing version into a curated record.
-
-    Returns an outcome dict — ``{"outcome": "transformed"|"skipped"|"failed",
-    "identifier": ..., "error": ...}`` — instead of raising, so a single bad
-    record never aborts the pool. Shares thread-safe Mongo/S3 handles with the
-    caller.
-    """
+    """Transform one landing version. Returns an outcome dict instead of
+    raising, so one bad record never kills the pool."""
 
     identifier = current_state.get("identifier", "unknown")
 
@@ -199,23 +170,43 @@ def _process_record(
 
         bucket, key = _parse_s3_uri(record["file_path"])
         obj = s3.get_object(Bucket=bucket, Key=key)
-        raw = obj["Body"].read()
-        downloaded_hash = sha256_bytes(raw)
-
-        if downloaded_hash != record["file_hash"]:
-            raise ValueError(
-                "Landing object hash mismatch for "
-                f"{identifier}: metadata={record['file_hash']} "
-                f"downloaded={downloaded_hash}"
-            )
         ext = str(record["file_ext"]).lower()
 
+        out_key = _curated_object_key(
+            record["body"], record["partition_date"], identifier, ext
+        )
+
         if ext in PASSTHROUGH_EXTS:
-            out_bytes = raw
-            new_hash = downloaded_hash
+            # Stream S3 -> spool -> S3 while hashing; memory stays bounded
+            # no matter how large the document is.
             content_type = record.get("content_type") or "application/octet-stream"
+            with _spooled_copy(obj["Body"]) as (spool, downloaded_hash, size_bytes):
+                if downloaded_hash != record["file_hash"]:
+                    raise ValueError(
+                        "Landing object hash mismatch for "
+                        f"{identifier}: metadata={record['file_hash']} "
+                        f"downloaded={downloaded_hash}"
+                    )
+                new_hash = downloaded_hash
+                spool.seek(0)
+                s3.upload_fileobj(
+                    spool,
+                    cfg.s3_curated_bucket,
+                    out_key,
+                    ExtraArgs={"ContentType": content_type},
+                )
 
         elif ext == "html":
+            # HTML needs the whole DOM anyway; verify integrity before parsing.
+            raw = obj["Body"].read()
+            downloaded_hash = sha256_bytes(raw)
+            if downloaded_hash != record["file_hash"]:
+                raise ValueError(
+                    "Landing object hash mismatch for "
+                    f"{identifier}: metadata={record['file_hash']} "
+                    f"downloaded={downloaded_hash}"
+                )
+
             canonical = canonicalize_html(
                 raw,
                 selectors=cfg.html_selector_list,
@@ -226,6 +217,7 @@ def _process_record(
 
             out_bytes = canonical.html_bytes
             new_hash = sha256_bytes(out_bytes)
+            size_bytes = len(out_bytes)
             content_type = "text/html; charset=utf-8"
 
             logger.info(
@@ -239,22 +231,16 @@ def _process_record(
                 },
             )
 
+            s3.put_object(
+                Bucket=cfg.s3_curated_bucket,
+                Key=out_key,
+                Body=out_bytes,
+                ContentType=content_type,
+            )
+
         else:
             raise ValueError(f"Unsupported landing file extension: {ext!r}")
 
-        # File NAME is <identifier>.<ext> (rename requirement), namespaced by
-        # body + partition so the key can never collide across bodies/partitions
-        # that reuse an identifier (consistent with the (source, body,
-        # identifier) natural key and the landing layout).
-        out_key = _curated_object_key(
-            record["body"], record["partition_date"], identifier, ext
-        )
-        s3.put_object(
-            Bucket=cfg.s3_curated_bucket,
-            Key=out_key,
-            Body=out_bytes,
-            ContentType=content_type,
-        )
         new_path = f"s3://{cfg.s3_curated_bucket}/{out_key}"
 
         curated_doc = {
@@ -275,8 +261,8 @@ def _process_record(
             "file_ext": ext,
             "file_path": new_path,
             "file_hash": new_hash,
-            "size_bytes": len(out_bytes),
-            # Lineage back to the exact landing version this was derived from
+            "size_bytes": size_bytes,
+            # Lineage to the exact landing version this came from.
             "source_version_id": version_id,
             "source_content_hash": record["content_hash"],
             "source_file_path": record["file_path"],
@@ -287,12 +273,9 @@ def _process_record(
         }
         curated.update_one(nat_key, {"$set": curated_doc}, upsert=True)
 
-        # Curated is a latest-only view: if this rewrite lands under a new key
-        # (e.g. the source ext changed HTML -> PDF, or the slug changed), delete
-        # the object the previous curated record pointed at so no orphan is left
-        # behind. Best-effort — the curated record already points at new_path, so
-        # a failed cleanup is a stray object, not a correctness problem. (Only
-        # curated is mutable; landing is never touched here.)
+        # Curated is latest-only: drop the object the old record pointed at if
+        # the key moved. Best-effort — a failed delete is a stray object, not
+        # a correctness problem. Landing is never touched here.
         old_path = existing.get("file_path") if existing else None
         if old_path and old_path != new_path:
             try:
@@ -333,20 +316,32 @@ def _process_record(
         return {"outcome": "failed", "identifier": identifier, "error": str(exc)}
 
 
+# 1 MiB read chunks; files over 8 MiB spill from RAM to disk.
+_STREAM_CHUNK_BYTES = 1024 * 1024
+_SPOOL_MAX_BYTES = 8 * 1024 * 1024
+
+
+@contextmanager
+def _spooled_copy(stream) -> Iterator[tuple[IO[bytes], str, int]]:
+    """Stream an S3 body into a spooled temp file, hashing along the way.
+    Yields (spool at EOF, sha256 hexdigest, size)."""
+    digest = hashlib.sha256()
+    size = 0
+    with tempfile.SpooledTemporaryFile(max_size=_SPOOL_MAX_BYTES) as spool:
+        for chunk in stream.iter_chunks(_STREAM_CHUNK_BYTES):
+            digest.update(chunk)
+            spool.write(chunk)
+            size += len(chunk)
+        yield spool, digest.hexdigest(), size
+
+
 def _curated_object_key(
     body: str, partition_date: str, identifier: str, ext: str
 ) -> str:
-    """Key for one curated object.
-
-    Mirrors the landing layout (``body=`` / ``partition=`` Hive prefix) so both
-    zones are navigable the same way, but the basename is ``<identifier>.<ext>``
-    as the rename requirement mandates — with the identifier key-sanitised so a
-    source value like ``RP89/2008, MN99/2008`` cannot split the filename into
-    extra path segments (raw identifiers stay verbatim in metadata). Curated is
-    a *latest-only* derived view (one object per logical document), so — unlike
-    landing — there is no content-hash version segment and a superseded object
-    is deleted on rewrite.
-    """
+    """Curated key: landing's body=/partition= layout, but the basename is
+    <identifier>.<ext> (rename requirement), key-sanitised so identifiers
+    like ``RP89/2008`` can't inject path segments. Latest-only, so no
+    content-hash segment."""
 
     return (
         f"body={slug(body)}/partition={partition_date}/"

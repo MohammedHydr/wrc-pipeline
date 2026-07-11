@@ -25,6 +25,8 @@ per-request overhead** — not micro-optimizing the HTML parser (which is alread
 | 3 | Transform parallelized across records with a bounded thread pool | `transform/transform.py`, `TRANSFORM_WORKERS` | Overlaps S3/Mongo latency — the single biggest wall-clock win; idempotent regardless of completion order |
 | 4 | Cookie middleware disabled (`COOKIES_ENABLED=false`) | `scraper/wrc_scraper/settings.py` | Flow is stateless GET (recon-confirmed); removes per-request cookie overhead and avoids volatile tracking cookies |
 | 5 | Download memory guard (`DOWNLOAD_MAXSIZE` / `DOWNLOAD_WARNSIZE`) | `scraper/wrc_scraper/settings.py` | Bounds memory for buffered document downloads; an oversized response becomes an **auditable failure** via the errback, never a silent loss or OOM |
+| 6 | Conditional re-fetches (`If-None-Match` → 304) | `wrc_spider.py:_load_validators()/_conditional_headers()`, state `latest_etag` | Unchanged known documents cost a header exchange, **zero body bytes** — measured live (PDF w/ ETag → `304, size_download: 0`). Dynamic HTML pages send no validators (`no-cache`), so they re-fetch + hash-compare — provably the only change detection there. Toggle: `USE_CONDITIONAL_REQUESTS` |
+| 7 | Streaming pass-through transform (`_spooled_copy`) | `transform/transform.py` | PDF/DOC bytes stream S3→spool→S3 while hashing (1 MiB chunks; ≤8 MiB spools in RAM, larger spills to disk) — transform memory bounded regardless of document size |
 
 ### Notes on #2 (`need_html`)
 

@@ -81,6 +81,8 @@ immutable version history.
 | `latest_file_path` | string | Object key of the current version |
 | `latest_size_bytes` | int | Size of the current version |
 | `latest_file_ext`, `latest_content_type` | string | Current version file type |
+| `latest_etag` | string? | ETag observed on the artifact response (PDFs have them; dynamic HTML pages send none) — drives the next run's `If-None-Match` conditional re-fetch (304 → unchanged, zero bytes) |
+| `latest_fetched_url` | string? | URL the artifact bytes actually came from (case page vs embedded PDF) — the ETag is only replayed against this exact URL |
 | `first_seen_at` / `first_run_id` | datetime / string | Insert-only; document first observed |
 | `last_seen_at` / `last_run_id` | datetime / string | Updated every run (even when unchanged) |
 

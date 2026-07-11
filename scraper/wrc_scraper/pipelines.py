@@ -1,32 +1,8 @@
-"""Scrapy item pipelines for WRC document ingestion.
+"""Item pipelines: hash/dedup -> object storage -> metadata.
 
-Pipeline order:
-
-1. HashAndDedupPipeline
-   Calculates:
-   * file_hash: SHA-256 of the exact downloaded bytes.
-   * content_hash: SHA-256 of stable legal content.
-
-   It compares the calculated content hash with the latest document state.
-
-2. ObjectStoragePipeline
-   Stores new or changed raw files in the landing object-storage bucket.
-   Unchanged files are not uploaded again.
-
-3. MongoMetadataPipeline
-   Inserts immutable document versions into the landing collection and
-   updates a separate mutable state collection that points to the latest
-   version.
-
-Collections:
-
-landing_document_versions
-    Immutable version history. Application code never updates or deletes
-    records in this collection.
-
-document_state
-    One mutable record per logical document. It points to the latest immutable
-    landing version and records when the document was most recently observed.
+Landing versions (`landing_document_versions`) are immutable and append-only;
+`document_state` is the one mutable pointer to a document's latest version.
+All blocking Mongo/S3 I/O runs off the reactor thread (deferToThread).
 """
 
 from __future__ import annotations
@@ -56,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 def _natural_key(adapter: ItemAdapter) -> dict[str, Any]:
-    """Return the stable identity of one logical legal document."""
+    """Stable identity of one logical document."""
 
     return {
         "source": adapter["source"],
@@ -66,7 +42,7 @@ def _natural_key(adapter: ItemAdapter) -> dict[str, Any]:
 
 
 def _version_key(adapter: ItemAdapter) -> dict[str, Any]:
-    """Return the immutable identity of one document version."""
+    """Immutable identity of one document version."""
 
     return {
         **_natural_key(adapter),
@@ -75,15 +51,9 @@ def _version_key(adapter: ItemAdapter) -> dict[str, Any]:
 
 
 def _landing_object_key(adapter: ItemAdapter) -> str:
-    """Deterministic, collision-safe key for one immutable landing object.
-
-    The bucket already names the zone, so the key is just the Hive-partitioned
-    (``body=`` / ``partition=``) data layout. The content hash in the filename
-    makes every distinct content version a new object, which is what keeps the
-    landing zone append-only. The identifier segment is key-sanitised (EAT
-    identifiers such as ``RP89/2008, MN99/2008`` would otherwise inject extra
-    path levels); the raw identifier stays verbatim in metadata.
-    """
+    """Landing key: body=/partition= layout, content hash as filename (each
+    distinct version is a new object — that's what keeps landing append-only).
+    Identifier is key-sanitised; the raw value stays in metadata."""
 
     return (
         f"body={slug(adapter['body'])}/"
@@ -101,26 +71,52 @@ class HashAndDedupPipeline:
         self.client = get_mongo_client(self.cfg)
         database = self.client[self.cfg.mongo_db]
 
-        # Deduplication checks the mutable latest-version pointer rather than
-        # searching or updating immutable landing versions.
+        # Dedup reads the mutable latest pointer, never the version history.
         self.state = database[self.cfg.mongo_state_collection]
-        # Read-only lookup used to recognise content that flipped back to a
-        # previously stored version (avoids uploading an orphan raw object).
+        # Read-only: recognises content that flipped back to an older version.
         self.versions = database[self.cfg.mongo_landing_collection]
 
     def close_spider(self) -> None:
         self.client.close()
 
     def process_item(self, item, spider):
-        # The Mongo lookups below block; run them on a reactor worker thread so
-        # in-flight downloads keep progressing. Scrapy awaits the returned
-        # Deferred before handing the item to the next pipeline, so per-item
-        # stage ordering is unchanged; run_stats updates are marshalled back to
-        # the reactor thread (callFromThread) to stay race-free.
+        # Blocking I/O off the reactor; Scrapy awaits the Deferred, so
+        # per-item stage order is unchanged. Stats go back via callFromThread.
         return deferToThread(self._process, item, spider)
 
     def _process(self, item, spider):
         adapter = ItemAdapter(item)
+
+        if adapter.get("not_modified"):
+            # 304: no body was sent — resolve hashes/path from state.
+            existing_state = self.state.find_one(_natural_key(adapter))
+            if existing_state is None:
+                # We only send ETags that came from a state record.
+                raise ValueError(
+                    "304 Not Modified received but no state record exists for "
+                    f"{adapter.get('identifier')}"
+                )
+            adapter["unchanged"] = True
+            adapter["known_version"] = False
+            adapter["file_hash"] = existing_state["latest_file_hash"]
+            adapter["content_hash"] = existing_state["latest_content_hash"]
+            adapter["file_path"] = existing_state["latest_file_path"]
+            adapter["size_bytes"] = existing_state.get("latest_size_bytes", 0)
+            adapter["file_ext"] = existing_state.get("latest_file_ext")
+            adapter["content_type"] = existing_state.get("latest_content_type")
+
+            key = (adapter["partition_label"], adapter["body"])
+            reactor.callFromThread(spider.note_unchanged, key)
+
+            logger.info(
+                "document unchanged via 304; no bytes re-downloaded",
+                extra={
+                    "identifier": adapter["identifier"],
+                    "file_hash": adapter["file_hash"],
+                    "file_path": adapter["file_path"],
+                },
+            )
+            return item
 
         content = adapter.get("file_content")
         if not content:
@@ -130,7 +126,6 @@ class HashAndDedupPipeline:
 
         file_ext = str(adapter.get("file_ext") or "").lower()
 
-        # Exact hash of the bytes downloaded from WRC.
         raw_file_hash = sha256_bytes(content)
 
         adapter["file_hash"] = raw_file_hash
@@ -143,8 +138,8 @@ class HashAndDedupPipeline:
                 parser=self.cfg.html_parser,
                 drop_selectors=self.cfg.html_drop_selector_list,
                 min_text_chars=self.cfg.html_min_text_chars,
-                # Change detection only needs content_bytes for the hash; the
-                # curated HTML is produced later by the transform step.
+                # Only the hash input is needed here; curated HTML is built
+                # later by the transform.
                 need_html=False,
             )
 
@@ -163,7 +158,7 @@ class HashAndDedupPipeline:
                 },
             )
         else:
-            # For binary documents, exact file bytes define the version.
+            # For binaries the exact bytes define the version.
             adapter["content_hash"] = raw_file_hash
 
         existing_state = self.state.find_one(
@@ -185,11 +180,9 @@ class HashAndDedupPipeline:
         adapter["known_version"] = False
 
         if not unchanged:
-            # Content differs from the CURRENT state, but it may match an
-            # OLDER immutable version (content flipped A -> B -> back to A).
-            # Reuse that version's stored object instead of uploading a raw
-            # file no version record would ever reference; the metadata
-            # pipeline's DuplicateKeyError path then repoints state to it.
+            # Differs from the current state, but may match an OLDER version
+            # (A -> B -> back to A). Reuse that version's object instead of
+            # uploading one no record would reference.
             prior_version = self.versions.find_one(
                 _version_key(adapter),
                 {"file_hash": 1, "file_path": 1, "size_bytes": 1},
@@ -211,7 +204,7 @@ class HashAndDedupPipeline:
                 )
 
         if unchanged:
-            # Preserve metadata for the exact raw file already stored.
+            # Keep pointing at the exact raw file already stored.
             adapter["file_hash"] = existing_state["latest_file_hash"]
             adapter["file_path"] = existing_state["latest_file_path"]
             adapter["size_bytes"] = existing_state.get(
@@ -251,15 +244,13 @@ class ObjectStoragePipeline:
         )
 
     def process_item(self, item, spider):
-        # S3 put_object blocks; keep it off the reactor thread.
         return deferToThread(self._process, item, spider)
 
     def _process(self, item, spider):
         adapter = ItemAdapter(item)
 
         if adapter.get("unchanged") or adapter.get("known_version"):
-            # Unchanged content, or content identical to an older stored
-            # version — the raw object for these bytes already exists.
+            # The object for these bytes already exists.
             return item
 
         key = _landing_object_key(adapter)
@@ -299,9 +290,7 @@ class MongoMetadataPipeline:
         self.versions = database[self.cfg.mongo_landing_collection]
         self.state = database[self.cfg.mongo_state_collection]
 
-        # One immutable record for every meaningful content version.
-        # Binary content_hash equals file_hash. HTML content_hash represents
-        # canonical legal content.
+        # One immutable record per content version.
         self.versions.create_index(
             [
                 ("source", ASCENDING),
@@ -335,7 +324,7 @@ class MongoMetadataPipeline:
             name="content_hash_1",
         )
 
-        # Exactly one mutable state record for each logical document.
+        # Exactly one mutable state record per logical document.
         self.state.create_index(
             [
                 ("source", ASCENDING),
@@ -358,7 +347,6 @@ class MongoMetadataPipeline:
         self.client.close()
 
     def process_item(self, item, spider):
-        # Mongo insert/upsert block; keep them off the reactor thread.
         return deferToThread(self._process, item, spider)
 
     def _process(self, item, spider):
@@ -367,17 +355,16 @@ class MongoMetadataPipeline:
         natural_key = _natural_key(adapter)
 
         if adapter.get("unchanged"):
-            # The immutable landing version is not touched. Only mutable
-            # operational state records that it was observed again.
-            self.state.update_one(
-                natural_key,
-                {
-                    "$set": {
-                        "last_seen_at": now,
-                        "last_run_id": spider.run_id,
-                    }
-                },
-            )
+            # Landing version untouched; just record the observation. A fresh
+            # ETag (hash-compare route) refreshes the validator.
+            observed = {
+                "last_seen_at": now,
+                "last_run_id": spider.run_id,
+            }
+            if adapter.get("etag"):
+                observed["latest_etag"] = adapter["etag"]
+                observed["latest_fetched_url"] = adapter.get("fetched_url")
+            self.state.update_one(natural_key, {"$set": observed})
 
             adapter["file_content"] = b""
             self._count_scraped(adapter, spider)
@@ -453,7 +440,7 @@ class MongoMetadataPipeline:
                 )
 
             except DuplicateKeyError:
-                # Genuine concurrent insertion race.
+                # Concurrent insert of the same version — adopt it.
                 stored_version = self.versions.find_one(_version_key(adapter))
 
                 if stored_version is None:
@@ -487,6 +474,9 @@ class MongoMetadataPipeline:
             "latest_size_bytes": stored_version["size_bytes"],
             "latest_file_ext": stored_version["file_ext"],
             "latest_content_type": stored_version.get("content_type"),
+            # None for dynamic HTML pages (they send no ETag).
+            "latest_etag": adapter.get("etag"),
+            "latest_fetched_url": adapter.get("fetched_url"),
             "last_seen_at": now,
             "last_run_id": spider.run_id,
         }
@@ -509,10 +499,8 @@ class MongoMetadataPipeline:
 
     @staticmethod
     def _count_scraped(adapter: ItemAdapter, spider) -> None:
-        """Count success only here: the document is now fully persisted
-        (hashed, object stored, metadata + state written). Counting at
-        download time would let pipeline-stage failures pose as successes.
-        Runs on a worker thread, so the increment is marshalled to the
-        reactor thread — every run_stats mutation stays single-threaded."""
+        """Success is counted only here, once fully persisted — a failure in
+        any earlier stage can never pose as a success. Marshalled to the
+        reactor thread so run_stats stays single-threaded."""
         key = (adapter["partition_label"], adapter["body"])
         reactor.callFromThread(spider.note_scraped, key)

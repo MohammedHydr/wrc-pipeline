@@ -1,10 +1,5 @@
-"""Shared utilities used by both the scraper and the transformation script:
-
-* structured (JSON) logging setup
-* date-partition generation
-* file hashing
-* Mongo / S3 client factories
-"""
+"""Shared utilities: JSON logging, date partitioning, hashing, key
+normalisation, and Mongo/S3 client factories."""
 
 from __future__ import annotations
 
@@ -16,8 +11,8 @@ import uuid
 from datetime import date, datetime, timedelta
 from typing import Iterator, Optional, Tuple
 
-import boto3  # type: ignore[import-untyped]
-from botocore.config import Config as BotoConfig  # type: ignore[import-untyped]
+import boto3
+from botocore.config import Config as BotoConfig
 from pymongo import MongoClient
 from pythonjsonlogger import json as jsonlogger
 from config.settings import Settings
@@ -27,12 +22,12 @@ from config.settings import Settings
 # Logging
 # --------------------------------------------------------------------------- #
 def new_run_id() -> str:
-    """Short unique id correlating every log line of one pipeline run."""
+    """Short id correlating every log line of one pipeline run."""
     return uuid.uuid4().hex[:12]
 
 
 class _RunIdFilter(logging.Filter):
-    """Injects the run_id into every log record so all JSON lines carry it."""
+    """Stamp run_id onto every record so all JSON lines carry it."""
 
     def __init__(self, run_id: str) -> None:
         super().__init__()
@@ -47,11 +42,8 @@ class _RunIdFilter(logging.Filter):
 def configure_json_logging(
     level: str = "INFO", run_id: Optional[str] = None
 ) -> logging.Logger:
-    """Configure the root logger to emit one JSON object per line to stdout.
-
-    Fields: timestamp, level, name, message, run_id + any `extra={...}` keys,
-    which is how we attach partition / body / counters to every log record.
-    """
+    """One JSON object per line to stdout: timestamp, level, name, message,
+    run_id, plus any `extra={...}` keys (partition/body/counters)."""
     handler = logging.StreamHandler(sys.stdout)
     formatter = jsonlogger.JsonFormatter(
         "%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -80,12 +72,9 @@ def _add_month(d: date) -> date:
 def iter_partitions(
     start: date, end: date, size: str = "monthly"
 ) -> Iterator[Tuple[date, date]]:
-    """Yield inclusive `(window_start, window_end)` pairs covering [start, end].
-
-    `size` is one of: daily | weekly | monthly. Monthly windows are aligned to
-    calendar months (the first/last window may be partial), which makes
-    partition_date values stable and human-readable across runs.
-    """
+    """Inclusive (window_start, window_end) pairs covering [start, end].
+    Monthly windows align to calendar months (first/last may be partial), so
+    partition_date values stay stable across runs."""
     if start > end:
         raise ValueError(f"start ({start}) must be <= end ({end})")
 
@@ -109,7 +98,7 @@ def iter_partitions(
 
 
 def parse_cli_date(value: str) -> date:
-    """Parse dates given as YYYY-MM-DD or DD-MM-YYYY (both accepted)."""
+    """Accept YYYY-MM-DD, DD-MM-YYYY, or DD/MM/YYYY."""
     for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
         try:
             return datetime.strptime(value, fmt).date()
@@ -128,25 +117,19 @@ def sha256_bytes(data: bytes) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Key normalisation
+# Key normalisation (raw values always stay verbatim in metadata)
 # --------------------------------------------------------------------------- #
 def slug(value: str) -> str:
-    """Lower-case, filesystem/object-key-safe form of a label (e.g. a body
-    name) for use in deterministic storage-key prefixes. Source values are
-    preserved verbatim in metadata; only keys are normalised."""
+    """Lower-case, key-safe form of a label (e.g. a body name) for storage
+    key prefixes."""
     return "".join(c.lower() if c.isalnum() else "-" for c in value).strip("-")
 
 
 def safe_identifier(value: str) -> str:
-    """Filesystem/object-key-safe form of a source identifier for storage keys.
-
-    Some sources emit identifiers containing path- and filename-hostile
-    characters (EAT: ``RP89/2008, MN99/2008``; WRC: ``IR - SC - 00001595``).
-    A raw ``/`` would introduce bogus key path segments, so any run of
-    characters outside ``A-Za-z0-9._-`` collapses to a single ``-`` (case is
-    kept — identifiers are case-stable and stay recognisable). The raw value
-    is preserved verbatim in metadata; only keys/filenames use this form.
-    """
+    """Key-safe form of a source identifier. Some sources emit hostile
+    values (EAT: ``RP89/2008, MN99/2008``) whose ``/`` would inject extra
+    key path segments; any run outside ``A-Za-z0-9._-`` collapses to one
+    ``-``, case kept so identifiers stay recognisable."""
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value)
     cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-.")
     return cleaned or "unknown"

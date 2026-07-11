@@ -1,32 +1,12 @@
-"""Spider for the Workplace Relations "Decisions and Determinations" search.
+"""Spider for the WRC "Decisions and Determinations" search.
 
-Strategy
---------
-The advanced-search form is an ASP.NET WebForms page, but submitting it
-**redirects to a plain GET search endpoint** (confirmed via `scrapy shell`
-recon — see docs/recon/wrc-search.md). We therefore skip the brittle VIEWSTATE
-form-post entirely and query that endpoint directly:
-
-    GET /en/search/?decisions=1&from=DD/MM/YYYY&to=DD/MM/YYYY&body=<code>&pageNumber=<n>
-
-1. For each (body x date-partition), request page 1 of the results.
-2. On page 1, read the total result count ("Shows 1 to 10 of N results") and
-   fan out requests for the remaining pages (10 results per page).
-3. For every result card (`li.each-item`) extract listing metadata, then
-   request the linked document:
-      * .pdf / .doc / .docx / .rtf  -> stored verbatim
-      * anything else (case .html)  -> the HTML page is fetched and stored
-4. Items flow through pipelines: hash -> dedup -> object storage -> MongoDB.
-
-Structured JSON logs include: current partition, body, records found vs
-successfully scraped, failed downloads (URL + error/status), and an
-end-of-run summary (also persisted to Mongo).
-
-Selectors are anchored on the stable result-card structure discovered in
-recon: `li.each-item` with `span.refNO` (identifier), `h2.title a`
-(title + link), `span.date` (DD/MM/YYYY) and `p.description@title` (parties).
-If the markup changes, re-verify with `scrapy shell` and update the fixtures
-in tests/.
+The ASP.NET search form 302-redirects to a plain GET endpoint (recon:
+docs/recon/wrc-search.md), so we query that directly — no VIEWSTATE, no
+browser. Flow: one page-1 request per (body x partition), paginate from the
+"Shows 1 to 10 of N results" total, extract each result card, then fetch its
+document (binaries verbatim, case pages as HTML). Every discovered record
+ends in exactly one auditable state — the run summary reconciles
+found = scraped + failed + parse_failed + skipped + listing losses.
 """
 
 from __future__ import annotations
@@ -85,16 +65,14 @@ class WrcSpider(scrapy.Spider):
         self.start_date: date = parse_cli_date(start_date)
         self.end_date: date = parse_cli_date(end_date)
         self.partition_size = (partition or self.cfg.partition_size).lower()
-        # Source netloc is part of every record's natural key (source, body,
-        # identifier); compute it once so the spider and the fast-mode dedup
-        # set agree with what MongoMetadataPipeline persists.
+        # Netloc is part of the natural key; compute once so spider and
+        # pipelines agree.
         self.source: str = urlparse(self.cfg.wrc_base_url).netloc
         self.body_codes: Dict[str, str] = self.cfg.body_code_map
         self.per_page: int = self.cfg.wrc_results_per_page
         self.bodies: List[str] = (
             [b.strip() for b in bodies.split(",")] if bodies else self.cfg.bodies_list
         )
-        # Legacy embedded-decision-PDF detection (see _embedded_decision_pdf).
         self.pdf_exclude: List[str] = self.cfg.embedded_pdf_exclude_list
         self.pdf_path_markers: List[str] = self.cfg.embedded_pdf_path_marker_list
 
@@ -102,47 +80,39 @@ class WrcSpider(scrapy.Spider):
             iter_partitions(self.start_date, self.end_date, self.partition_size)
         )
 
-        # run statistics keyed by (partition_label, body). "scraped" counts
-        # documents that were FULLY PERSISTED (hashed, stored, metadata
-        # written) — incremented by MongoMetadataPipeline, not at download
-        # time, so a failure in any pipeline stage is never counted as a
-        # success. "unchanged" is the subset of scraped whose content hash
-        # matched a previous run. Item failures at any stage (download,
-        # canonicalization, storage, metadata) are appended to "failed", so
-        # every discovered record ends in exactly one auditable state:
-        # found == scraped(succeeded, incl. unchanged) + failed.
+        # Per-(partition, body) counters. "scraped" is only incremented once a
+        # document is fully persisted (by MongoMetadataPipeline), never at
+        # download time; "unchanged" is its subset. Everything else exists so
+        # the close-time reconciliation can account for every found record —
+        # unusable cards, fast-mode skips, requests that never reached a
+        # terminal state, and records lost with a failed listing page.
         self.run_stats: Dict[Tuple[str, str], Dict] = defaultdict(
             lambda: {
                 "found": None,
                 "scraped": 0,
                 "unchanged": 0,
                 "failed": [],
-                # Listing cards discovered but unusable (missing identifier/link):
-                # counted in "found" by the site total, so they must reach an
-                # auditable state here rather than being silently dropped.
                 "parse_failures": [],
-                # Records intentionally not fetched this run (fast-mode skip of an
-                # already-known identifier). Counted so reconciliation still holds.
                 "skipped": 0,
-                # Document requests actually enqueued for download. Reconciled at
-                # close against terminal states (scraped + failed); any positive
-                # remainder is a silent loss (e.g. a callback-level exception or a
-                # request dropped at shutdown) that would otherwise vanish.
                 "docs_enqueued": 0,
                 "listing_failures": [],
                 "count_parse_failed": False,
             }
         )
-        # (source, body, identifier) -> file_hash, for fast-mode skip
+        # (source, body, identifier) -> file_hash, for fast-mode skip.
         self.known_hashes: Dict[Tuple[str, str, str], str] = {}
+        # (source, body, identifier) -> (etag, fetched_url). ETags are only
+        # replayed against the exact URL they were observed on.
+        self.validators: Dict[Tuple[str, str, str], Tuple[str, str]] = {}
 
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
         spider = super().from_crawler(crawler, *args, **kwargs)
-        # Only pay the full landing-collection scan when fast mode will actually
-        # consult it; the default (hash-compare) mode never reads known_hashes.
+        # Each preload is a full collection scan — only pay for what's on.
         if spider.cfg.skip_existing_identifiers:
             spider._load_known_hashes()
+        if spider.cfg.use_conditional_requests:
+            spider._load_validators()
 
         crawler.signals.connect(
             spider._on_item_error,
@@ -156,8 +126,7 @@ class WrcSpider(scrapy.Spider):
         return spider
 
     def _load_known_hashes(self) -> None:
-        """Preload (source, body, identifier)->hash from Mongo to support the
-        optional `skip_existing_identifiers` fast mode. Failure is non-fatal."""
+        """Preload known identifiers for fast mode. Non-fatal on failure."""
         try:
             client = get_mongo_client(self.cfg)
             coll = client[self.cfg.mongo_db][self.cfg.mongo_landing_collection]
@@ -179,6 +148,50 @@ class WrcSpider(scrapy.Spider):
                 "could not preload identifiers from mongo",
                 extra={"error": str(exc)},
             )
+
+    def _load_validators(self) -> None:
+        """Preload stored ETags so re-fetches can 304 instead of re-download.
+        Non-fatal: without them the crawl degrades to re-fetch + hash-compare."""
+        try:
+            client = get_mongo_client(self.cfg)
+            coll = client[self.cfg.mongo_db][self.cfg.mongo_state_collection]
+            self.validators = {
+                (d.get("source", ""), d.get("body", ""), d["identifier"]): (
+                    d["latest_etag"],
+                    d.get("latest_fetched_url") or "",
+                )
+                for d in coll.find(
+                    {"latest_etag": {"$nin": [None, ""]}},
+                    {
+                        "source": 1,
+                        "body": 1,
+                        "identifier": 1,
+                        "latest_etag": 1,
+                        "latest_fetched_url": 1,
+                    },
+                )
+            }
+            client.close()
+            self.logger.info(
+                "loaded etag validators from mongo",
+                extra={"count": len(self.validators)},
+            )
+        except Exception as exc:  # noqa: BLE001 - deliberately broad, non-fatal
+            self.logger.warning(
+                "could not preload etag validators from mongo",
+                extra={"error": str(exc)},
+            )
+
+    def _conditional_headers(
+        self, nat_key: Tuple[str, str, str], url: str
+    ) -> Optional[Dict[str, str]]:
+        """If-None-Match headers when we hold an ETag for this exact URL.
+        The URL match matters: a legacy record's ETag belongs to its embedded
+        PDF, not the case page the listing links to."""
+        validator = self.validators.get(nat_key)
+        if validator and validator[0] and validator[1] == url:
+            return {"If-None-Match": validator[0]}
+        return None
 
     # ------------------------------------------------------------------ #
     # Step 1: fan out (body x partition) page-1 search requests
@@ -222,12 +235,9 @@ class WrcSpider(scrapy.Spider):
                 )
 
     def _search_url(self, win_start: date, win_end: date, code: str, page: int) -> str:
-        """Build the GET search URL. Dates keep literal slashes (as the site
-        emits them); everything is sourced from config."""
         frm = win_start.strftime(self.cfg.wrc_date_format)
         to = win_end.strftime(self.cfg.wrc_date_format)
-        # Drop any stale query on the configured search path (e.g. a leftover
-        # "?advance=true") so we never build a double-"?" URL.
+        # Drop any stale query (e.g. "?advance=true") — no double-"?" URLs.
         base = self.cfg.search_url.split("?", 1)[0]
         return f"{base}?decisions=1&from={frm}&to={to}&body={code}&pageNumber={page}"
 
@@ -238,15 +248,13 @@ class WrcSpider(scrapy.Spider):
         meta = response.meta
         key = (meta["partition_label"], meta["body"])
 
-        # Extract once so we can distinguish an empty result set from a broken
-        # total-count parser.
         records = list(self._extract_records(response))
 
         if meta["page"] == 1:
             total = self._extract_total(response)
 
             if total is None and not records:
-                # Successful search page with no result cards means zero records.
+                # No count text and no cards: genuinely zero results.
                 total = 0
                 self.run_stats[key]["found"] = 0
                 self.run_stats[key]["count_parse_failed"] = False
@@ -262,8 +270,8 @@ class WrcSpider(scrapy.Spider):
                 )
 
             elif total is None:
-                # Cards exist but the total-count text was not understood.
-                # This is a real parsing problem and must not be reported as zero.
+                # Cards exist but the count didn't parse — a real problem
+                # that must not masquerade as zero.
                 self.run_stats[key]["found"] = None
                 self.run_stats[key]["count_parse_failed"] = True
 
@@ -290,7 +298,6 @@ class WrcSpider(scrapy.Spider):
                     },
                 )
 
-            # Request remaining pages only when a positive total was parsed.
             if total is not None and total > 0:
                 pages = math.ceil(total / self.per_page)
 
@@ -318,7 +325,6 @@ class WrcSpider(scrapy.Spider):
                         },
                     )
 
-        # Continue processing the records already extracted above.
         for rec in records:
             identifier = rec["identifier"]
             nat_key = (
@@ -353,21 +359,26 @@ class WrcSpider(scrapy.Spider):
 
             ext = _url_extension(rec["doc_url"])
 
-            # Count the request as enqueued *before* yielding it: closed()
-            # reconciles docs_enqueued against terminal states so a request that
-            # is later dropped without a callback/errback (silent loss) is still
-            # surfaced rather than quietly reducing the scraped count.
+            # Counted before yielding: a request that later vanishes without
+            # callback or errback still shows up in the reconciliation.
             self.run_stats[key]["docs_enqueued"] += 1
+
+            doc_meta = {
+                "item": item,
+                "ext_hint": ext,
+                **_ctx(meta),
+            }
+            headers = self._conditional_headers(nat_key, rec["doc_url"])
+            if headers:
+                # 304 is a success here — keep it away from HttpError.
+                doc_meta["handle_httpstatus_list"] = [304]
 
             yield scrapy.Request(
                 rec["doc_url"],
                 callback=self.parse_document,
                 errback=self.on_document_failed,
-                meta={
-                    "item": item,
-                    "ext_hint": ext,
-                    **_ctx(meta),
-                },
+                headers=headers,
+                meta=doc_meta,
                 dont_filter=False,
             )
 
@@ -378,16 +389,9 @@ class WrcSpider(scrapy.Spider):
         return int(m.group(1).replace(",", "")) if m else None
 
     def _extract_records(self, response: Response):
-        """Extract result cards from the listing.
-
-        Each card is `<li class="each-item">` with a stable structure:
-          * identifier   -> span.refNO
-          * title + link -> h2.title a
-          * date         -> span.date (DD/MM/YYYY)
-          * description  -> p.description@title (parties)
-        """
-        # A response is only guaranteed to carry meta when tied to a request;
-        # fall back to placeholders so parse-failure accounting still works.
+        """Yield result-card dicts from a listing page (`li.each-item`:
+        span.refNO, h2.title a, span.date, p.description@title)."""
+        # Responses without a request (tests) still need failure accounting.
         meta = response.request.meta if response.request is not None else {}
         key = (meta.get("partition_label", "?"), meta.get("body", "?"))
         cards = response.css("li.each-item")
@@ -398,11 +402,8 @@ class WrcSpider(scrapy.Spider):
                 or card.css("h2.title a::attr(href)").get()
             )
             if not identifier or not href:
-                # The card counts toward the site's total ("of N results") but we
-                # cannot build a document identity from it. Record it as an
-                # auditable parse failure so `found` still reconciles to
-                # scraped + failed + parse_failures + ... instead of silently
-                # dropping the record and leaving an unexplained shortfall.
+                # The site's total counts this card, so it must land in an
+                # auditable bucket — not silently disappear.
                 entry = {
                     "url": response.url,
                     "identifier": identifier or None,
@@ -418,8 +419,8 @@ class WrcSpider(scrapy.Spider):
                 continue
 
             title = (card.css("h2.title a::text").get() or identifier).strip()
-            # Description lives in the title attribute (clean, no child markup);
-            # collapse the embedded newlines the site uses between parties.
+            # The title attribute holds the clean description; collapse the
+            # site's embedded newlines between parties.
             description = " ".join(
                 (card.css("p.description::attr(title)").get() or "").split()
             )
@@ -445,13 +446,11 @@ class WrcSpider(scrapy.Spider):
     def _embedded_decision_pdf(
         self, response: Response, identifier: str
     ) -> Optional[str]:
-        """Return the absolute URL of a legacy decision PDF embedded in an HTML
-        case page, or None.
+        """URL of a legacy decision PDF embedded in an HTML case page, or None.
 
-        A link qualifies when its filename contains the record identifier (e.g.
-        Equality's ``DEC-E2000-14.pdf``) or it sits under a known legacy import
-        path (e.g. EAT's GUID-named PDFs under ``/eat_import/``). Site-chrome
-        PDFs (cookie policy, info guides) are excluded. The first match wins.
+        A link qualifies when its filename contains the identifier (Equality's
+        ``DEC-E2000-14.pdf``) or sits under a known legacy import path (EAT's
+        GUID-named PDFs). Site-chrome PDFs are excluded; first match wins.
         """
         norm_id = _norm(identifier)
         for href in response.css("a::attr(href)").getall():
@@ -474,10 +473,23 @@ class WrcSpider(scrapy.Spider):
     def parse_document(self, response: Response):
         item: WrcDocumentItem = response.meta["item"]
 
-        # A callback that raises here is only logged to Scrapy's
-        # `spider_exceptions` stat and never reaches errback, so the record would
-        # vanish from run_stats (neither scraped nor failed). Wrap the body so any
-        # unexpected error becomes an auditable document failure instead.
+        # 304: stored artifact is current, no body was sent. Pipelines resolve
+        # hashes/path from state and count it as unchanged.
+        if response.status == 304:
+            self.logger.info(
+                "document not modified (304); stored artifact is current",
+                extra={
+                    "identifier": item["identifier"],
+                    "url": response.url,
+                    **_ctx(response.meta),
+                },
+            )
+            item["not_modified"] = True
+            yield item
+            return
+
+        # An exception here would never reach the errback and the record would
+        # vanish from run_stats — wrap it so it becomes an auditable failure.
         try:
             content_type = (
                 (response.headers.get("Content-Type") or b"").decode("latin-1").lower()
@@ -491,10 +503,9 @@ class WrcSpider(scrapy.Spider):
                 else:
                     ext = "html"
 
-            # For a legacy case page the decision is a PDF embedded in the HTML
-            # wrapper, not the wrapper itself. Follow that PDF and store it as
-            # the authoritative artifact; the wrapper is only an index. Guarded
-            # by `pdf_followed` so the fetched PDF (ext=pdf) is never re-scanned.
+            # Legacy case pages embed the real decision as a PDF; follow it
+            # and store that instead of the wrapper. `pdf_followed` stops the
+            # fetched PDF from being re-scanned.
             if (
                 ext == "html"
                 and self.cfg.follow_embedded_pdf
@@ -510,36 +521,36 @@ class WrcSpider(scrapy.Spider):
                             **_ctx(response.meta),
                         },
                     )
+                    pdf_meta = {
+                        "item": item,
+                        "ext_hint": "pdf",
+                        "pdf_followed": True,
+                        # If the PDF fetch fails (robots.txt forbids the legacy
+                        # import paths), the errback stores this permitted
+                        # wrapper instead — the record still succeeds.
+                        "wrapper_body": response.body,
+                        "wrapper_content_type": content_type,
+                        **_ctx(response.meta),
+                    }
+                    nat_key = (self.source, item["body"], item["identifier"])
+                    pdf_headers = self._conditional_headers(nat_key, pdf_url)
+                    if pdf_headers:
+                        pdf_meta["handle_httpstatus_list"] = [304]
                     yield scrapy.Request(
                         pdf_url,
                         callback=self.parse_document,
                         errback=self.on_document_failed,
-                        meta={
-                            "item": item,
-                            "ext_hint": "pdf",
-                            "pdf_followed": True,
-                            # Fallback payload: if the PDF fetch is denied
-                            # (e.g. robots.txt forbids the legacy import path)
-                            # or fails, the errback stores this permitted HTML
-                            # wrapper instead, so the record still ends
-                            # succeeded with the best allowed artifact.
-                            "wrapper_body": response.body,
-                            "wrapper_content_type": content_type,
-                            **_ctx(response.meta),
-                        },
+                        headers=pdf_headers,
+                        meta=pdf_meta,
                         dont_filter=False,
                     )
-                    # The follow-up PDF request produces this record's terminal
-                    # state; the wrapper contributes neither scraped nor failed.
+                    # The PDF request produces this record's terminal state.
                     return
 
             body = response.body
 
-            # Don't trust the URL extension / Content-Type alone: a 200 response
-            # can still be the wrong payload (e.g. a `.pdf` link that returns an
-            # HTML "not found" interstitial). Verify the bytes match the expected
-            # type via magic bytes; a mismatch is recorded as an auditable failure
-            # rather than being stored under a lying extension.
+            # A 200 can still be the wrong payload (a .pdf link answering with
+            # an HTML interstitial) — verify magic bytes before storing.
             if not _content_matches_ext(ext, body):
                 self._record_document_failure(
                     response,
@@ -555,6 +566,11 @@ class WrcSpider(scrapy.Spider):
             item["file_content"] = body
             item["file_ext"] = ext
             item["content_type"] = content_type
+            # Validator for the next run's conditional re-fetch, tied to the
+            # exact URL the bytes came from.
+            etag = (response.headers.get("ETag") or b"").decode("latin-1").strip()
+            item["etag"] = etag or None
+            item["fetched_url"] = response.url
         except Exception as exc:  # noqa: BLE001 - keep the record auditable
             self._record_document_failure(
                 response,
@@ -564,22 +580,17 @@ class WrcSpider(scrapy.Spider):
             )
             return
 
-        # NOTE: "scraped" is NOT incremented here. Success is counted by
-        # MongoMetadataPipeline once the document is fully persisted, so a
-        # failure in hashing/storage/metadata never masquerades as a success.
+        # "scraped" is counted by MongoMetadataPipeline after full persistence,
+        # never here — a later stage failure must not look like a success.
         yield item
 
     def note_scraped(self, key: Tuple[str, str]) -> None:
-        """Count one fully persisted document. Pipelines run their blocking
-        I/O on worker threads and marshal this call back to the reactor
-        thread (callFromThread), so every run_stats mutation — spider
-        callbacks, errbacks, signal handlers, and these counters — happens
-        single-threaded and needs no lock."""
+        """Count one fully persisted document. Pipelines marshal this back to
+        the reactor thread, so run_stats stays single-threaded — no locks."""
         self.run_stats[key]["scraped"] += 1
 
     def note_unchanged(self, key: Tuple[str, str]) -> None:
-        """Count one unchanged document (same marshalling contract as
-        note_scraped)."""
+        """Count one unchanged document (same contract as note_scraped)."""
         self.run_stats[key]["unchanged"] += 1
 
     def _record_document_failure(
@@ -590,8 +601,8 @@ class WrcSpider(scrapy.Spider):
         stage: str,
         error: str,
     ) -> None:
-        """Record a document that downloaded (HTTP-wise) but is unusable, so it
-        still ends in exactly one auditable state: found = scraped + failed."""
+        """A document that downloaded but is unusable — record it so the
+        found = scraped + failed reconciliation holds."""
         meta = response.meta
         key = (meta.get("partition_label", "?"), meta.get("body", "?"))
         entry = {
@@ -616,12 +627,9 @@ class WrcSpider(scrapy.Spider):
         status = getattr(getattr(failure.value, "response", None), "status", None)
         key = (meta.get("partition_label", "?"), meta.get("body", "?"))
 
-        # Embedded-PDF follow that carried a fallback payload: the authoritative
-        # PDF is unreachable (robots.txt forbids the legacy import paths, or the
-        # fetch failed), but the HTML case page it was embedded in is permitted
-        # and already downloaded. Store the wrapper as the record's artifact so
-        # the record ends succeeded with the best allowed content instead of
-        # failing on a document we are not allowed to fetch.
+        # PDF follow that carried a fallback payload: the PDF is unreachable
+        # (usually robots.txt), but the case page it came from is permitted and
+        # already downloaded — store that instead of failing the record.
         wrapper_body = meta.get("wrapper_body")
         if wrapper_body:
             item: WrcDocumentItem = meta["item"]
@@ -675,8 +683,9 @@ class WrcSpider(scrapy.Spider):
         page = int(meta.get("page") or 1)
         found = self.run_stats[key]["found"]
 
+        # How many records this failed listing page put at risk. Page 1 means
+        # the total itself is unknown.
         if page == 1:
-            # The total result count is unavailable.
             records_at_risk = None
         elif found is not None:
             page_offset = (page - 1) * self.per_page
@@ -727,7 +736,7 @@ class WrcSpider(scrapy.Spider):
         spider,
         failure,
     ) -> None:
-        """Record exceptions raised by hashing, storage, or metadata pipelines."""
+        """Record exceptions raised inside the item pipelines."""
 
         adapter, key = self._item_failure_context(item)
 
@@ -792,11 +801,8 @@ class WrcSpider(scrapy.Spider):
     # Step 4: end-of-run summary
     # ------------------------------------------------------------------ #
     def _reconcile_partition(self, partition: str, body: str, stats: Dict) -> Dict:
-        """Turn one (partition, body)'s raw counters into an auditable summary.
-
-        Pure: no logging or I/O, so the reconciliation invariant can be unit
-        tested directly. Every discovered record must land in exactly one bucket.
-        """
+        """One (partition, body)'s counters as an auditable summary. Pure, so
+        the reconciliation invariant is unit-testable."""
         document_failures = stats["failed"]
         parse_failures = stats["parse_failures"]
         listing_failures = stats["listing_failures"]
@@ -809,20 +815,14 @@ class WrcSpider(scrapy.Spider):
             failure.get("records_at_risk") is None for failure in listing_failures
         )
 
-        # Document requests we enqueued but that never reached a terminal state
-        # (scraped, unchanged-counted-as-scraped, or a recorded failure). A
-        # positive value is a silent loss — e.g. a request dropped by the
-        # dupefilter/at shutdown, or a callback exception that never surfaced —
-        # and is reported so it can never quietly shrink the scraped count.
+        # Enqueued requests that never reached a terminal state = silent loss
+        # (dropped at shutdown, dupe-filtered, …). Surfaced, never hidden.
         doc_unaccounted = max(
             stats["docs_enqueued"] - stats["scraped"] - len(document_failures),
             0,
         )
 
-        # Every discovered record must land in exactly one auditable bucket:
-        # scraped (incl. unchanged) + document failures + unusable listing cards
-        # + intentionally-skipped + records lost on failed listing pages +
-        # silently-lost document requests.
+        # Every found record must land in exactly one bucket.
         accounted_records = (
             stats["scraped"]
             + len(document_failures)
@@ -869,7 +869,7 @@ class WrcSpider(scrapy.Spider):
         }
 
     def _build_summary(self, reason: str) -> Dict:
-        """Assemble the full run summary from run_stats. Pure (no I/O)."""
+        """Full run summary from run_stats. Pure (no I/O)."""
         partition_summaries = [
             self._reconcile_partition(partition, body, stats)
             for (partition, body), stats in sorted(self.run_stats.items())
@@ -926,8 +926,7 @@ class WrcSpider(scrapy.Spider):
 
         summary = self._build_summary(reason)
 
-        # Escalate any silent document losses so they are visible in logs, not
-        # only in the persisted summary.
+        # Silent losses deserve a loud log line, not just a summary field.
         for partition_summary in summary["partitions"]:
             if partition_summary["records_unaccounted"]:
                 self.logger.error(
@@ -978,29 +977,22 @@ def _url_extension(url: str) -> Optional[str]:
 
 
 def _norm(value: str) -> str:
-    """Lowercase and strip all non-alphanumerics, so an identifier can be
-    matched inside a filename regardless of separators/case
-    (``DEC-E2000-14`` -> ``dece200014`` matches ``dec-e2000-14.pdf``)."""
+    """Strip case and separators so DEC-E2000-14 matches dec-e2000-14.pdf."""
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
-# Leading "magic bytes" for the binary types we store verbatim. HTML (and any
-# other/unknown ext) has no reliable signature, so it is not signature-checked.
+# Magic bytes for binaries stored verbatim. HTML has no reliable signature.
 _DOCUMENT_MAGIC: Dict[str, Tuple[bytes, ...]] = {
-    "docx": (b"PK\x03\x04",),  # OOXML is a zip container
+    "docx": (b"PK\x03\x04",),  # OOXML zip container
     "doc": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",),  # OLE2 compound file
     "rtf": (b"{\\rtf",),
 }
 
 
 def _content_matches_ext(ext: Optional[str], content: bytes) -> bool:
-    """True if ``content`` plausibly matches ``ext`` by its magic bytes.
-
-    PDFs are matched leniently (``%PDF`` anywhere in the first 1 KiB, as some
-    files carry a short preamble); other binaries must start with their exact
-    signature. HTML and unknown extensions have no signature and always pass —
-    HTML content is validated later by the canonicalizer's text-length gate.
-    """
+    """Does the payload plausibly match its extension? PDFs are matched
+    leniently (%PDF within the first 1 KiB — some carry a preamble); other
+    binaries must start with their signature; HTML/unknown always pass."""
     if ext == "pdf":
         return b"%PDF" in content[:1024]
 

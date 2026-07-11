@@ -1,17 +1,9 @@
-"""Scrapy settings.
+"""Scrapy settings. Every tunable comes from config.settings (env-driven).
 
-All tunables come from `config.settings.Settings` (env vars / .env file),
-so nothing here is hardcoded. The politeness strategy for "fastest without
-getting blocked" is:
-
-* AutoThrottle: dynamically adapts concurrency/delay to observed latency,
-  so we go as fast as the server comfortably allows and back off when it
-  slows down or errors.
-* Bounded per-domain concurrency + a small base delay.
-* Retry middleware with an extended status list (incl. 429) — Scrapy's
-  RetryMiddleware applies exponential-ish backoff via redownload slots.
-* HTTP compression + DNS cache to cut per-request overhead.
-* robots.txt respected by default (configurable).
+"Fastest without getting blocked" = AutoThrottle rides the server's real
+latency between a polite floor (DOWNLOAD_DELAY) and bounded per-domain
+concurrency; retries cover transient statuses only; robots.txt is obeyed.
+Trade-offs and rejected "fast spider" tips: docs/performance.md.
 """
 
 from config.settings import get_settings
@@ -46,20 +38,24 @@ RETRY_HTTP_CODES = [429, 500, 502, 503, 504, 522, 524, 408]
 COMPRESSION_ENABLED = True
 DNSCACHE_ENABLED = True
 
-# The WRC flow is stateless GET, so the cookie middleware is unnecessary
-# overhead (and avoids storing volatile tracking cookies). See recon notes.
+# Stateless GET flow — the cookie middleware is pure overhead.
 COOKIES_ENABLED = _cfg.cookies_enabled
 
-# Memory guard for buffered document downloads. Exceeding the max cancels the
-# download (recorded as an auditable failure via the errback); warnsize logs.
+# Memory guard: over max = auditable failure via errback; warnsize logs.
 DOWNLOAD_MAXSIZE = _cfg.download_maxsize
 DOWNLOAD_WARNSIZE = _cfg.download_warnsize
 
-# Optional local HTTP cache — useful during development to avoid re-hitting
-# the site while iterating on selectors.
+# Dev-only response cache for iterating on selectors without re-hitting the site.
 HTTPCACHE_ENABLED = _cfg.http_cache_enabled
 HTTPCACHE_EXPIRATION_SECS = 3600
 HTTPCACHE_DIR = "httpcache"
+
+# Resume an interrupted backfill only — a stale JOBDIR dupe-filters document
+# requests and breaks the found/scraped reconciliation on a fresh rerun.
+JOBDIR = _cfg.jobdir or None
+
+# DNS + the pipelines' blocking Mongo/S3 I/O run on this pool.
+REACTOR_THREADPOOL_MAXSIZE = _cfg.reactor_threadpool_maxsize
 
 # --- Pipelines ----------------------------------------------------------------
 ITEM_PIPELINES = {
@@ -67,15 +63,6 @@ ITEM_PIPELINES = {
     "wrc_scraper.pipelines.ObjectStoragePipeline": 200,
     "wrc_scraper.pipelines.MongoMetadataPipeline": 300,
 }
-
-# Resume an interrupted long backfill (scheduler + dupefilter state). Off by
-# default: a stale JOBDIR would dupe-filter every document request on a fresh
-# rerun and break the found/scraped reconciliation. Set only while resuming.
-JOBDIR = _cfg.jobdir or None
-
-# Reactor thread pool (DNS etc.). Scrapy default 10; raise for many-host
-# crawls (50+ sources) — negligible on this single-domain crawl.
-REACTOR_THREADPOOL_MAXSIZE = _cfg.reactor_threadpool_maxsize
 
 # --- Misc ----------------------------------------------------------------------
 REQUEST_FINGERPRINTER_IMPLEMENTATION = "2.7"

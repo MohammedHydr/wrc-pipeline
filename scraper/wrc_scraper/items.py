@@ -20,6 +20,9 @@ class WrcDocumentItem(scrapy.Item):
     file_content = scrapy.Field()  # raw bytes
     file_ext = scrapy.Field()  # "pdf" | "doc" | "docx" | "html"
     content_type = scrapy.Field()  # response Content-Type header
+    etag = scrapy.Field()  # response ETag (drives If-None-Match re-fetches)
+    fetched_url = scrapy.Field()  # URL the artifact bytes actually came from
+    not_modified = scrapy.Field()  # bool: server answered 304 (no body sent)
 
     # --- computed in pipelines -----------------------------------------------
     file_hash = scrapy.Field()  # SHA-256 of the exact downloaded bytes

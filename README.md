@@ -156,8 +156,12 @@ Everything (connection strings, buckets, partition size, concurrency, delays,
 retries, user agent, selectors, …) is set in `.env` — see `.env.example` for
 the full list with comments. No hardcoded values.
 
-Two toggles worth knowing:
+Toggles worth knowing:
 
+* `USE_CONDITIONAL_REQUESTS=true` (default) — re-fetches of known documents
+  send `If-None-Match` with the stored ETag; a 304 marks the record unchanged
+  with **zero body bytes** re-downloaded. (The dynamic HTML case pages send no
+  validators — measured — so those re-fetch and hash-compare.)
 * `SKIP_EXISTING_IDENTIFIERS=true` — fast incremental mode: identifiers
   already in Mongo are not re-downloaded at all (skips change detection).
 * `HTML_CONTENT_SELECTORS` — ordered CSS selectors used to isolate the
@@ -211,5 +215,15 @@ pip install -r requirements-dev.txt   # pytest, ruff, mypy
 pytest tests/ -q
 ```
 
-Covers date partitioning, HTML content extraction and hashing/idempotency
-key logic (the pure-Python parts that don't need the live site).
+Three layers:
+
+* **Unit tests** — date partitioning, HTML content extraction, hashing,
+  object keys, spider parsing against live-captured fixtures, conditional
+  re-fetch (304) handling. No network, no DB.
+* **Integration tests** (`tests/test_integration_idempotency.py`) — run the
+  real item pipelines against the compose stack in a throwaway
+  database/bucket and prove the idempotency contract (rerun → no duplicates,
+  no new objects; changed content → append-only new version). Auto-skip when
+  the stack is down.
+* **Live smoke test** (opt-in): `WRC_LIVE_SMOKE=1 pytest tests/test_live_smoke.py`
+  — one polite GET verifying the search contract the spider depends on.

@@ -1,21 +1,7 @@
-"""Dagster orchestration for the WRC ingestion pipeline.
-
-Execution order:
-
-    scrape_landing_zone
-            |
-            v
-    transform_to_curated
-            |
-            v
-    enrich_decisions
-
-MongoDB and MinIO run through the existing Docker Compose stack.
-Dagster, Scrapy, and the transformation run natively on Windows.
-
-`wrc_monthly_incremental` schedules the same job for the previous calendar
-month, turning the backfill pipeline into a living monthly feed.
-"""
+"""Dagster orchestration: scrape_landing_zone >> transform_to_curated >>
+enrich_decisions, plus a monthly schedule (`wrc_monthly_incremental`) that
+turns the backfill into a living feed. Mongo/MinIO come from docker compose;
+Dagster, Scrapy and the transforms run natively."""
 
 import os
 import subprocess
@@ -30,10 +16,7 @@ from transform.enrich import run_enrichment
 from transform.transform import run_transformation
 
 
-# definitions.py:
-# parents[0] = wrc_dagster
-# parents[1] = orchestration
-# parents[2] = repository root
+# wrc_dagster / orchestration / <repo root>
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRAPER_DIR = REPO_ROOT / "scraper"
 
@@ -101,11 +84,8 @@ def scrape_landing_zone(
     context: dg.OpExecutionContext,
     config: WrcPipelineConfig,
 ) -> dict[str, str]:
-    """Execute Scrapy in a subprocess.
-
-    Subprocess isolation avoids Twisted reactor lifecycle problems and keeps
-    Scrapy logging separate from the Dagster process.
-    """
+    """Run Scrapy in a subprocess — the Twisted reactor can't restart inside
+    a long-lived Dagster process."""
 
     _validate_config(config)
 
@@ -313,12 +293,8 @@ def wrc_pipeline():
 def wrc_monthly_incremental(
     context: dg.ScheduleEvaluationContext,
 ) -> dg.RunRequest:
-    """Scrape/transform/enrich the previous calendar month.
-
-    Turns the backfill pipeline into a living monthly feed: hash-based change
-    detection keeps the rerun idempotent, so records already ingested are
-    observed (last_seen_at) rather than duplicated.
-    """
+    """Scrape/transform/enrich the previous calendar month. Idempotency makes
+    the recurring rerun safe: known records are observed, never duplicated."""
     today = context.scheduled_execution_time.date()
     prev_end = today.replace(day=1) - timedelta(days=1)
     prev_start = prev_end.replace(day=1)

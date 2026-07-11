@@ -1,12 +1,8 @@
 """Deterministic HTML extraction and canonicalization.
 
-This module is shared by:
-
-* the scraper, which uses ``content_bytes`` to detect meaningful document
-  changes without being affected by volatile page chrome; and
-* the transformation step, which stores ``html_bytes`` in the curated zone.
-
-The exact raw response remains untouched in the landing object store.
+Shared by the scraper (``content_bytes`` -> change-detection hash immune to
+page chrome) and the transform (``html_bytes`` -> curated HTML). The raw
+response always stays untouched in landing.
 """
 
 from __future__ import annotations
@@ -22,8 +18,7 @@ from bs4 import BeautifulSoup, Comment, FeatureNotFound, NavigableString, Tag
 logger = logging.getLogger(__name__)
 
 
-# Elements that cannot be part of the legal decision itself or that commonly
-# introduce volatile values between requests.
+# Never part of the decision text, or volatile between requests.
 STRIP_TAGS: tuple[str, ...] = (
     "script",
     "style",
@@ -39,9 +34,8 @@ STRIP_TAGS: tuple[str, ...] = (
     "svg",
 )
 
-# Preserve only structural attributes that have meaning in legal tables/lists.
-# Styling, JavaScript, generated IDs and tracking attributes are deliberately
-# removed to keep canonical output deterministic.
+# Keep only attributes with structural meaning in legal tables/lists;
+# styling, IDs and tracking attributes go, so output stays deterministic.
 PRESERVED_ATTRIBUTES: dict[str, frozenset[str]] = {
     "td": frozenset({"colspan", "rowspan", "headers"}),
     "th": frozenset({"colspan", "rowspan", "scope", "headers"}),
@@ -55,28 +49,10 @@ _BETWEEN_TAGS_RE = re.compile(r">\s+<")
 
 @dataclass(frozen=True, slots=True)
 class CanonicalHtmlResult:
-    """Result returned by :func:`canonicalize_html`.
-
-    ``html_bytes``
-        Deterministic, minimal HTML suitable for curated storage.
-
-    ``content_bytes``
-        Normalized visible decision text suitable for semantic change
-        detection. Page scripts, navigation and dynamic attributes cannot
-        affect it.
-
-    ``selector_used``
-        CSS selector that successfully identified the document content.
-
-    ``fallback_used``
-        True when no configured selector matched and ``body`` was used.
-
-    ``text_length``
-        Length of normalized visible document text.
-
-    ``parser_used``
-        BeautifulSoup parser that successfully parsed the input.
-    """
+    """html_bytes = deterministic curated HTML; content_bytes = normalized
+    visible text (the change-detection hash input). The rest is diagnostics:
+    which selector matched, whether the body fallback kicked in, text length,
+    and which parser actually ran."""
 
     html_bytes: bytes
     content_bytes: bytes
@@ -87,7 +63,7 @@ class CanonicalHtmlResult:
 
 
 class HtmlCanonicalizationError(ValueError):
-    """Raised when an HTML document cannot produce meaningful content."""
+    """The document cannot produce meaningful content."""
 
 
 def canonicalize_html(
@@ -99,42 +75,12 @@ def canonicalize_html(
     min_text_chars: int = 200,
     need_html: bool = True,
 ) -> CanonicalHtmlResult:
-    """Extract and deterministically serialize relevant document content.
+    """Strip chrome, pick the first content selector with enough text, and
+    return canonical HTML + canonical visible text.
 
-    Processing order:
-
-    1. Parse the raw HTML.
-    2. Remove scripts, navigation, forms, comments and configured page chrome.
-    3. Select the first configured content container containing enough text.
-    4. Remove volatile attributes.
-    5. Normalize text and whitespace.
-    6. Return both canonical HTML and canonical visible text.
-
-    Args:
-        raw:
-            Exact HTML response bytes.
-        selectors:
-            Ordered CSS selectors. The first meaningful match is used.
-        parser:
-            Preferred BeautifulSoup parser.
-        drop_selectors:
-            Additional CSS selectors for source-specific page chrome.
-        min_text_chars:
-            Minimum normalized text length for a selector to be accepted.
-        need_html:
-            When True (default) the deterministic curated HTML is built and
-            returned in ``html_bytes``. When False — the scraper's change-
-            detection path, which only needs ``content_bytes`` for the content
-            hash — attribute cleaning, text-node rewriting and serialization are
-            skipped and ``html_bytes`` is empty. ``content_bytes`` is identical
-            either way (whitespace normalization is idempotent under the final
-            text collapse).
-
-    Raises:
-        HtmlCanonicalizationError:
-            When input is empty or no meaningful content can be produced.
-        ValueError:
-            When ``min_text_chars`` is less than one.
+    ``need_html=False`` is the scraper's change-detection path: it skips
+    attribute cleaning and serialization and returns empty ``html_bytes``
+    (``content_bytes`` is byte-identical either way).
     """
 
     if not raw:
@@ -162,8 +108,6 @@ def canonicalize_html(
         node = soup.body or soup
 
     if not need_html:
-        # Change-detection path: only the visible-text hash is needed, so skip
-        # attribute cleaning, text-node rewriting and serialization entirely.
         canonical_text = _normalize_text(node.get_text(" ", strip=True))
         if not canonical_text:
             raise HtmlCanonicalizationError(
@@ -228,19 +172,14 @@ def _parse_html(raw: bytes, parser: str) -> tuple[BeautifulSoup, str]:
 
 
 def _remove_comments(soup: BeautifulSoup) -> None:
-    """Remove comments because they may contain build or request metadata."""
+    """Comments can carry build/request metadata — drop them."""
 
     for comment in soup.find_all(string=lambda value: isinstance(value, Comment)):
         comment.extract()
 
 
 def _remove_tags(soup: BeautifulSoup) -> None:
-    """Remove globally irrelevant and volatile elements.
-
-    ``find_all`` accepts a list of names and matches any of them in a single
-    tree traversal, so all ``STRIP_TAGS`` are removed in one pass instead of
-    one full walk per tag name.
-    """
+    """Drop all STRIP_TAGS in one tree traversal (find_all takes a list)."""
 
     for tag in soup.find_all(list(STRIP_TAGS)):
         tag.decompose()
@@ -279,7 +218,7 @@ def _select_content_node(
     selectors: Sequence[str],
     min_text_chars: int,
 ) -> tuple[Tag | None, str | None]:
-    """Return the first selector match with enough normalized text."""
+    """First selector match with enough normalized text."""
 
     for selector in selectors:
         clean_selector = selector.strip()
@@ -309,7 +248,7 @@ def _select_content_node(
 
 
 def _clean_attributes(node: Tag) -> None:
-    """Remove volatile attributes while retaining legal table structure."""
+    """Strip volatile attributes, keeping legal table structure."""
 
     elements = [node, *node.find_all(True)]
 
@@ -324,8 +263,7 @@ def _clean_attributes(node: Tag) -> None:
             if attribute in element.attrs:
                 cleaned_attributes[attribute] = element.attrs[attribute]
 
-        # Replacing the complete mapping also removes generated IDs, classes,
-        # inline styles, event handlers, nonces and tracking attributes.
+        # Replacing the whole mapping drops IDs, classes, styles, handlers…
         element.attrs = cleaned_attributes
 
 
@@ -343,18 +281,14 @@ def _normalize_text_nodes(node: Tag) -> None:
             text_node.extract()
             continue
 
-        # Spaces around normalized text prevent adjacent inline elements from
-        # joining words together. Serialization removes inter-tag whitespace
-        # afterward, while visible-text extraction remains correct.
+        # Pad with spaces so adjacent inline elements can't join words;
+        # serialization strips inter-tag whitespace afterwards.
         text_node.replace_with(NavigableString(f" {normalized} "))
 
 
 def _serialize_contents(node: Tag) -> str:
-    """Serialize only the selected node's children.
-
-    Using ``decode_contents`` avoids creating a nested ``<body>`` when the
-    fallback node itself is the original body element.
-    """
+    """Serialize only the node's children — decode_contents avoids a nested
+    <body> when the fallback node is the body itself."""
 
     serialized = node.decode_contents(formatter="minimal")
     serialized = _BETWEEN_TAGS_RE.sub("><", serialized)
