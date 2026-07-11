@@ -92,6 +92,16 @@ class Settings(BaseSettings):
         )
     )
     http_cache_enabled: bool = Field(default=False)
+    # Persist scheduler + dupefilter state so an *interrupted* long backfill
+    # can resume where it stopped (scrapy JOBDIR). Empty = off (default):
+    # a leftover JOBDIR from a completed run would dupe-filter every document
+    # request on the next run and poison the found/scraped reconciliation, so
+    # it must only be set while resuming, then cleared.
+    jobdir: str = Field(default="")
+    # Twisted reactor thread pool (DNS resolution etc.). Scrapy's default is
+    # 10; matters when crawling many distinct hosts (50+ sources), harmless
+    # on a single-domain crawl with the DNS cache on.
+    reactor_threadpool_maxsize: int = Field(default=10, ge=1)
 
     # ------------------------------------------------------------------ #
     # MongoDB (metadata store)

@@ -100,9 +100,12 @@ python -m transform.enrich --start-date 2024-01-01 --end-date 2024-03-31
 ```
 
 Deterministic BeautifulSoup/regex extraction (no ML) of business fields from
-each curated HTML decision into the `enriched_decisions` collection: parties,
-acts cited, adjudication officer, hearing date, award amounts (€), coarse
-outcome signals — with lineage to the exact curated artifact. Legacy binary
+each curated HTML decision into the `enriched_decisions` collection: parties
+(+ anonymisation flag), acts and statute sections cited, practice-area
+taxonomy, cross-references to other decisions (citation graph), adjudication
+officer, decision type, hearing/receipt dates and days-to-decision, award
+amounts (€), representation flag, and a deterministic outcome
+(upheld/not_upheld/mixed) — with lineage to the exact curated artifact. Legacy binary
 scans are recorded as `extraction_status: binary_source` so text coverage
 stays measurable. Idempotent (skips unchanged source hash + extraction
 version). Example insight queries:

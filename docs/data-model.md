@@ -141,6 +141,15 @@ scans get `"binary_source"` (would need OCR) so coverage stays measurable.
 | `complaint_references` | string[] | `CA-XXXXXXXX-XXX` references |
 | `award_amounts_eur` / `award_max_eur` | number[] / number? | Monetary amounts found in the decision text |
 | `outcome_signals` | string[] | Coarse phrases found ("well founded", "dismissed", …) — signals, not a classification |
+| `sections_cited` | object[] | `{section, act}` pairs — statute-section facets |
+| `practice_areas` | string[] | Taxonomy derived from acts (unfair_dismissal, equality_discrimination, …) |
+| `cited_decisions` | string[] | Other decisions referenced — the precedent/citation graph |
+| `received_date` | string (ISO)? | Earliest complaint date of receipt |
+| `days_to_decision` | int? | Receipt → published decision (time-to-resolution metric) |
+| `decision_type` | string? | decision \| recommendation \| determination \| correction_order |
+| `outcome` | string? | upheld \| not_upheld \| mixed — deterministic phrase rules, never a guess |
+| `self_represented` | bool | "Self-Represented" appears in the decision |
+| `is_anonymised` | bool | Generic party descriptors ("A Worker v A Hotel") |
 | `extraction_status` | string | `extracted` \| `binary_source` |
 | `source_file_path` / `source_file_hash` | string | Lineage to the exact curated artifact |
 | `extraction_version` | string | Bump re-extracts without touching curated/landing |

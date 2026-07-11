@@ -68,6 +68,15 @@ ITEM_PIPELINES = {
     "wrc_scraper.pipelines.MongoMetadataPipeline": 300,
 }
 
+# Resume an interrupted long backfill (scheduler + dupefilter state). Off by
+# default: a stale JOBDIR would dupe-filter every document request on a fresh
+# rerun and break the found/scraped reconciliation. Set only while resuming.
+JOBDIR = _cfg.jobdir or None
+
+# Reactor thread pool (DNS etc.). Scrapy default 10; raise for many-host
+# crawls (50+ sources) — negligible on this single-domain crawl.
+REACTOR_THREADPOOL_MAXSIZE = _cfg.reactor_threadpool_maxsize
+
 # --- Misc ----------------------------------------------------------------------
 REQUEST_FINGERPRINTER_IMPLEMENTATION = "2.7"
 TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"

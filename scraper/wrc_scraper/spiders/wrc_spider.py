@@ -569,6 +569,19 @@ class WrcSpider(scrapy.Spider):
         # failure in hashing/storage/metadata never masquerades as a success.
         yield item
 
+    def note_scraped(self, key: Tuple[str, str]) -> None:
+        """Count one fully persisted document. Pipelines run their blocking
+        I/O on worker threads and marshal this call back to the reactor
+        thread (callFromThread), so every run_stats mutation — spider
+        callbacks, errbacks, signal handlers, and these counters — happens
+        single-threaded and needs no lock."""
+        self.run_stats[key]["scraped"] += 1
+
+    def note_unchanged(self, key: Tuple[str, str]) -> None:
+        """Count one unchanged document (same marshalling contract as
+        note_scraped)."""
+        self.run_stats[key]["unchanged"] += 1
+
     def _record_document_failure(
         self,
         response: Response,

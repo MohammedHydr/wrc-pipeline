@@ -58,20 +58,34 @@ idempotency is preserved. Worker count is env-driven via `TRANSFORM_WORKERS`
 - **`O(1)` fast-mode dedup** — `known_hashes` keyed by `(source, body, identifier)`.
 - **Item payload released** after storage (`file_content = b""`) to free memory.
 
-## Honest open item: don't block the reactor
+## Non-blocking item pipelines (applied)
 
 The item pipelines (`HashAndDedupPipeline`, `ObjectStoragePipeline`,
-`MongoMetadataPipeline`) perform **synchronous** `pymongo` and `boto3` calls
-inside `process_item`, which runs on Scrapy's Twisted reactor thread. While a
-blocking DB/S3 call runs, **no other downloads make progress**. This partly
-offsets the configured request concurrency.
+`MongoMetadataPipeline`) perform `pymongo` and `boto3` calls that block. They
+used to run on Scrapy's Twisted reactor thread, stalling all in-flight
+downloads for the duration of every DB/S3 call. Each `process_item` now
+returns `deferToThread(self._process, ...)`, so the blocking I/O runs on the
+reactor's worker thread pool (sized by `REACTOR_THREADPOOL_MAXSIZE`) while
+downloads keep progressing.
 
-This is the highest-leverage remaining throughput improvement that stays within
-the politeness policy. The fix is to move the blocking I/O off the reactor
-(`twisted.internet.threads.deferToThread`, or async pipelines). It is a
-non-trivial change with concurrency implications (client thread-safety, ordering,
-failure accounting), so it is **flagged, not silently applied**. Revisit if crawl
-throughput becomes the bottleneck.
+Design constraints that keep this safe:
+
+- **Per-item ordering unchanged** — Scrapy awaits each pipeline's Deferred
+  before handing the item to the next pipeline, so hash → store → metadata
+  still runs strictly in order for any given item.
+- **Race-free accounting** — worker threads never touch `run_stats` directly;
+  the `scraped`/`unchanged` counters are marshalled to the reactor thread via
+  `reactor.callFromThread(spider.note_scraped/-unchanged, key)`, so every
+  `run_stats` mutation (spider callbacks, errbacks, signal handlers, counters)
+  stays single-threaded. No locks needed.
+- **Failure accounting intact** — an exception inside the threaded `_process`
+  errbacks the Deferred; Scrapy fires `item_error`, which the spider already
+  records as an auditable failure.
+- **Client thread-safety** — `pymongo` and low-level `botocore` clients are
+  thread-safe (the transform step already shares them across a thread pool).
+- **Concurrent same-key writes** — the unique-index + `DuplicateKeyError`
+  recovery path in `MongoMetadataPipeline` was designed for concurrent
+  insertion races and covers them.
 
 ## Deliberately NOT done (conflicts with politeness)
 
@@ -86,9 +100,10 @@ politeness or realism:
 - Disabling retries to "go faster".
 - Stealth / anti-detection / TLS spoofing / CAPTCHA bypass.
 
-Raising `CONCURRENT_ITEMS` is also not useful today: because the item pipelines
-block the reactor (above), more concurrent items do not parallelize the actual
-I/O. It becomes worthwhile only after the pipelines are made non-blocking.
+With the pipelines now non-blocking, effective item parallelism is bounded by
+`REACTOR_THREADPOOL_MAXSIZE` (default 10) and `CONCURRENT_ITEMS` (Scrapy
+default 100) — the thread pool is the binding limit; raise it before touching
+`CONCURRENT_ITEMS`.
 
 ## Scaling to 50+ sources
 
@@ -97,11 +112,14 @@ These are the right levers when the crawl fans out across **many domains**
 
 - **`SCHEDULER_PRIORITY_QUEUE = "scrapy.pqueues.DownloaderAwarePriorityQueue"`** —
   balances the downloader across domains in a broad crawl.
-- **`REACTOR_THREADPOOL_MAXSIZE`** — larger DNS-resolver thread pool when
-  resolving many distinct hosts.
-- **`JOBDIR`** — persist scheduler/dupefilter state for resumable long crawls.
-- **Non-blocking item pipelines** (see open item) — required before per-domain
-  concurrency actually pays off.
+- **`REACTOR_THREADPOOL_MAXSIZE`** (env-driven, default 10) — larger
+  DNS-resolver thread pool when resolving many distinct hosts.
+- **`JOBDIR`** (env-driven, default off) — persist scheduler/dupefilter state
+  to resume an *interrupted* long backfill. Off for normal runs: a stale
+  JOBDIR dupe-filters every document request on a fresh rerun, which would
+  poison the found/scraped reconciliation.
+- **Non-blocking item pipelines** — already applied (above), a prerequisite
+  for per-domain concurrency to pay off.
 - **Horizontal partitioning** — the `(partition, body)` fan-out is already the
   natural unit of parallelism; run partitions/bodies as independent workers or
   processes rather than pushing a single spider's request rate up.

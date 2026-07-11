@@ -38,6 +38,8 @@ from typing import Any
 from itemadapter import ItemAdapter
 from pymongo import ASCENDING
 from pymongo.errors import DuplicateKeyError
+from twisted.internet import reactor
+from twisted.internet.threads import deferToThread
 
 from config.common import (
     ensure_bucket,
@@ -110,6 +112,14 @@ class HashAndDedupPipeline:
         self.client.close()
 
     def process_item(self, item, spider):
+        # The Mongo lookups below block; run them on a reactor worker thread so
+        # in-flight downloads keep progressing. Scrapy awaits the returned
+        # Deferred before handing the item to the next pipeline, so per-item
+        # stage ordering is unchanged; run_stats updates are marshalled back to
+        # the reactor thread (callFromThread) to stay race-free.
+        return deferToThread(self._process, item, spider)
+
+    def _process(self, item, spider):
         adapter = ItemAdapter(item)
 
         content = adapter.get("file_content")
@@ -213,7 +223,7 @@ class HashAndDedupPipeline:
                 adapter["partition_label"],
                 adapter["body"],
             )
-            spider.run_stats[key]["unchanged"] += 1
+            reactor.callFromThread(spider.note_unchanged, key)
 
             logger.info(
                 "document content unchanged since last run",
@@ -241,6 +251,10 @@ class ObjectStoragePipeline:
         )
 
     def process_item(self, item, spider):
+        # S3 put_object blocks; keep it off the reactor thread.
+        return deferToThread(self._process, item, spider)
+
+    def _process(self, item, spider):
         adapter = ItemAdapter(item)
 
         if adapter.get("unchanged") or adapter.get("known_version"):
@@ -344,6 +358,10 @@ class MongoMetadataPipeline:
         self.client.close()
 
     def process_item(self, item, spider):
+        # Mongo insert/upsert block; keep them off the reactor thread.
+        return deferToThread(self._process, item, spider)
+
+    def _process(self, item, spider):
         adapter = ItemAdapter(item)
         now = datetime.now(timezone.utc)
         natural_key = _natural_key(adapter)
@@ -493,6 +511,8 @@ class MongoMetadataPipeline:
     def _count_scraped(adapter: ItemAdapter, spider) -> None:
         """Count success only here: the document is now fully persisted
         (hashed, object stored, metadata + state written). Counting at
-        download time would let pipeline-stage failures pose as successes."""
+        download time would let pipeline-stage failures pose as successes.
+        Runs on a worker thread, so the increment is marshalled to the
+        reactor thread — every run_stats mutation stays single-threaded."""
         key = (adapter["partition_label"], adapter["body"])
-        spider.run_stats[key]["scraped"] += 1
+        reactor.callFromThread(spider.note_scraped, key)

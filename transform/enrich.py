@@ -49,7 +49,7 @@ logger = logging.getLogger("enrich")
 
 # Bump when extraction logic changes: stale records are re-extracted on the
 # next run (curated and landing stay untouched).
-EXTRACTION_VERSION = "1.2"
+EXTRACTION_VERSION = "2.0"
 
 # "Employment Equality Act, 1998" / "Industrial Relations Act 1969" /
 # "Employment Equality Acts, 1998 - 2015" / "Civil Law and Criminal Law
@@ -82,6 +82,85 @@ _OUTCOME_PHRASES = (
     "dismissed",
     "discrimination did not occur",
     "discrimination occurred",
+)
+
+# Positive / negative disposition phrase sets used to derive a coarse
+# document-level `outcome`. Phrases whose positive form is a substring of the
+# negated form ("well founded" in "not well founded") are compared by
+# occurrence count, so a negation is never double-counted as a positive.
+_POSITIVE_NEGATED_PAIRS = (
+    ("well founded", "not well founded"),
+    ("upheld", "not upheld"),
+)
+_POSITIVE_PHRASES = ("succeeds", "discrimination occurred")
+_NEGATIVE_PHRASES = ("dismissed", "discrimination did not occur")
+
+# References to other decisions cited in the text — the citation graph every
+# legal-research product is built on. Confident, source-verified formats only:
+# WRC adjudications (ADJ-XXXXXXXX), Labour Court recommendations (LCRxxxxx)
+# and lettered determinations (EDA/UDD/PWD/... + digits), Equality Tribunal
+# (DEC-Exxxx-xxx), EAT-style refs (UD123/2008, RP89/2008), and IR-SC refs.
+_DECISION_CITATION_RES = (
+    re.compile(r"\bADJ-\d{6,8}\b"),
+    re.compile(r"\bLCR\d{4,6}\b"),
+    re.compile(r"\bDEC-[A-Z]{1,2}\d{4}-\d{1,4}\b"),
+    re.compile(r"\b[A-Z]{2,3}\d{1,5}/\d{4}\b"),
+    re.compile(r"\b(?:EDA|UDD|PWD|TED|HSD|MWD|FTD|AWD|CD|DWT)\d{2,5}\b"),
+    re.compile(r"\bIR\s*-\s*SC\s*-\s*\d{8}\b"),
+)
+
+# "section 8(1) of the Unfair Dismissals Act 1977" — statute-section
+# granularity for faceted search ("all decisions under s.77 EEA").
+_SECTION_RE = re.compile(
+    r"[Ss]ections?\s+(\d+[A-Z]?(?:\(\d+\))?(?:\([a-z]\))?)\s+of\s+the\s+"
+)
+
+# Complaint-table row: "... Act, 1998  CA-00022612-001  15/10/2018" — the
+# date following a complaint reference is that complaint's date of receipt.
+_RECEIPT_AFTER_REF_RE = re.compile(r"CA-\d{8}-\d{3}\s+(\d{2}/\d{2}/\d{4})")
+_RECEIPT_LABELLED_RE = re.compile(
+    r"Date of Receipt:?\s*(\d{2}/\d{2}/\d{4})", re.IGNORECASE
+)
+
+# Instrument type from the page headings, first match wins.
+_DECISION_TYPES = (
+    ("correction order", "correction_order"),
+    ("adjudication officer decision", "decision"),
+    ("adjudication officer recommendation", "recommendation"),
+    ("determination", "determination"),
+    ("recommendation", "recommendation"),
+    ("decision", "decision"),
+)
+
+# Anonymised-party heuristic: generic descriptors used when the WRC withholds
+# names ("A Worker", "An Employee", "A Complainant", "Anonymised Parties").
+_GENERIC_PARTY_RE = re.compile(
+    r"^(?:An?\s+[A-Z]|Anonymised\b|Employee\b|Employer\b|Worker\b)"
+)
+
+# Act-name keyword -> practice area. Deterministic taxonomy that powers
+# faceted navigation ("browse unfair-dismissal cases") and per-area analytics.
+_PRACTICE_AREA_KEYWORDS = (
+    ("Unfair Dismissals", "unfair_dismissal"),
+    ("Employment Equality", "equality_discrimination"),
+    ("Equal Status", "equality_discrimination"),
+    ("Payment of Wages", "pay_wages"),
+    ("National Minimum Wage", "pay_wages"),
+    ("Organisation of Working Time", "working_time"),
+    ("Redundancy Payments", "redundancy"),
+    ("Minimum Notice", "notice_terms"),
+    ("Terms of Employment", "notice_terms"),
+    ("Industrial Relations", "industrial_relations"),
+    ("Safety, Health and Welfare", "health_safety"),
+    ("Protected Disclosures", "whistleblowing"),
+    ("Maternity Protection", "family_leave"),
+    ("Parental Leave", "family_leave"),
+    ("Paternity Leave", "family_leave"),
+    ("Carer's Leave", "family_leave"),
+    ("Fixed-Term", "atypical_work"),
+    ("Part-Time", "atypical_work"),
+    ("Temporary Agency", "atypical_work"),
+    ("Employment Permits", "employment_permits"),
 )
 
 
@@ -167,16 +246,127 @@ def extract_decision_fields(html: bytes | str, parser: str = "lxml") -> dict[str
     lowered = flat.lower()
     outcome_signals = [p for p in _OUTCOME_PHRASES if p in lowered]
 
+    # Statute-section citations: pair each "section X of the ..." with the act
+    # named immediately after it on the same line.
+    sections: list[dict[str, str]] = []
+    for line in lines:
+        for m in _SECTION_RE.finditer(line):
+            act_match = _ACT_RE.search(line, m.end())
+            if act_match:
+                entry = {
+                    "section": m.group(1),
+                    "act": f"{act_match.group(1).strip()} {act_match.group(2).strip()}",
+                }
+                if entry not in sections:
+                    sections.append(entry)
+
+    complaint_refs = sorted(set(_COMPLAINT_REF_RE.findall(flat)))
+
+    # Cross-references to other decisions (precedent/citation graph edges).
+    cited: list[str] = []
+    for pattern in _DECISION_CITATION_RES:
+        for ref in pattern.findall(flat):
+            normalised = " ".join(ref.split())
+            if normalised not in cited:
+                cited.append(normalised)
+
+    # Dates of receipt: labelled, or the date following a complaint reference
+    # in a complaint-table row. The earliest one starts the case clock.
+    receipt_dates: list[str] = []
+    for pattern in (_RECEIPT_LABELLED_RE, _RECEIPT_AFTER_REF_RE):
+        for raw in pattern.findall(flat):
+            try:
+                receipt_dates.append(
+                    datetime.strptime(raw, "%d/%m/%Y").date().isoformat()
+                )
+            except ValueError:
+                continue
+    received_date = min(receipt_dates) if receipt_dates else None
+
     return {
         "adjudication_officer": officer,
         "hearing_date": hearing_date,
         "acts_cited": acts,
-        "complaint_references": sorted(set(_COMPLAINT_REF_RE.findall(flat))),
+        "sections_cited": sections,
+        "practice_areas": derive_practice_areas(acts),
+        "complaint_references": complaint_refs,
+        "cited_decisions": cited,
+        "received_date": received_date,
+        "decision_type": _derive_decision_type(lowered),
+        "self_represented": "self-represented" in lowered
+        or "self represented" in lowered,
         "award_amounts_eur": awards,
         "award_max_eur": max(awards) if awards else None,
         "outcome_signals": outcome_signals,
+        "outcome": derive_outcome(lowered),
         "text_length": len(flat),
     }
+
+
+def derive_outcome(lowered_text: str) -> Optional[str]:
+    """Coarse document-level disposition from deterministic phrase rules.
+
+    Multi-complaint decisions frequently uphold some complaints and dismiss
+    others, so a document with both signals is "mixed" — never a guess at a
+    single winner. Returns upheld | not_upheld | mixed | None (no signal).
+    """
+    positive = any(
+        lowered_text.count(pos) > lowered_text.count(neg)
+        for pos, neg in _POSITIVE_NEGATED_PAIRS
+    ) or any(p in lowered_text for p in _POSITIVE_PHRASES)
+
+    negative = any(neg in lowered_text for _, neg in _POSITIVE_NEGATED_PAIRS) or any(
+        p in lowered_text for p in _NEGATIVE_PHRASES
+    )
+
+    if positive and negative:
+        return "mixed"
+    if positive:
+        return "upheld"
+    if negative:
+        return "not_upheld"
+    return None
+
+
+def derive_practice_areas(acts: list[str]) -> list[str]:
+    """Map cited acts onto the practice-area taxonomy (order-stable, unique)."""
+    areas: list[str] = []
+    for act in acts:
+        for keyword, area in _PRACTICE_AREA_KEYWORDS:
+            if keyword in act and area not in areas:
+                areas.append(area)
+    return areas
+
+
+def _derive_decision_type(lowered_text: str) -> Optional[str]:
+    for phrase, decision_type in _DECISION_TYPES:
+        if phrase in lowered_text:
+            return decision_type
+    return None
+
+
+def is_anonymised(complainant: Optional[str], respondent: Optional[str]) -> bool:
+    """True when either party is a generic descriptor rather than a name."""
+    return any(
+        _GENERIC_PARTY_RE.match(party) is not None
+        for party in (complainant, respondent)
+        if party
+    )
+
+
+def _days_between(start_iso: Optional[str], end_iso: Optional[str]) -> Optional[int]:
+    """Whole days from start to end (ISO date strings); None when either is
+    missing, unparsable, or the interval is negative (bad source data must
+    yield no metric rather than a nonsense one)."""
+    if not start_iso or not end_iso:
+        return None
+    try:
+        start = datetime.strptime(start_iso, "%Y-%m-%d").date()
+        end = datetime.strptime(end_iso, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    delta = (end - start).days
+    return delta if delta >= 0 else None
 
 
 def split_parties(description: Optional[str]) -> dict[str, Optional[str]]:
@@ -216,6 +406,11 @@ def run_enrichment(
     enriched.create_index([("partition_date", ASCENDING)])
     enriched.create_index([("acts_cited", ASCENDING)])
     enriched.create_index([("adjudication_officer", ASCENDING)])
+    # Multikey indexes powering the product queries: faceted browse by
+    # practice area, "cited by" precedent lookups, and outcome analytics.
+    enriched.create_index([("practice_areas", ASCENDING)])
+    enriched.create_index([("cited_decisions", ASCENDING)])
+    enriched.create_index([("outcome", ASCENDING)])
 
     s3 = get_s3_client(cfg)
 
@@ -301,7 +496,20 @@ def _enrich_record(
             bucket, _, key = bucket_and_key.partition("/")
             raw = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
             fields = extract_decision_fields(raw, parser=cfg.html_parser)
-            doc = {**base, **fields, "extraction_status": "extracted"}
+            doc = {
+                **base,
+                **fields,
+                "is_anonymised": is_anonymised(
+                    base.get("complainant"), base.get("respondent")
+                ),
+                # Case duration: first complaint receipt -> published decision.
+                # A core operational metric (time-to-resolution) for insurers,
+                # HR teams, and the tribunal service itself.
+                "days_to_decision": _days_between(
+                    fields.get("received_date"), record.get("published_date")
+                ),
+                "extraction_status": "extracted",
+            }
             outcome = "extracted"
         else:
             # Legacy binary scans (PDF/DOC) would need OCR; record the gap
