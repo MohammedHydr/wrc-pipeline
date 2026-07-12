@@ -1,6 +1,6 @@
 # Data Model
 
-MongoDB database `wrc` (configurable via `MONGO_DB`). Four collections, each
+MongoDB database `wrc` (configurable via `MONGO_DB`). Five collections, each
 with a single clear responsibility. All timestamps are timezone-aware UTC.
 
 ## Identity and hashing
@@ -132,10 +132,15 @@ One record per `(source, body, identifier)`, derived from the curated
 artifact by deterministic BeautifulSoup/regex extraction (`transform/enrich.py`,
 no ML). HTML decisions get `extraction_status: "extracted"`; legacy binary
 scans get `"binary_source"` (would need OCR) so coverage stays measurable.
+Binary-source records carry only the metadata, party split, and lineage
+fields plus empty text fields (`paragraphs: []`, counts `0`); the extraction
+fields (`adjudication_officer` through `is_anonymised`) appear on `extracted`
+records.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `source`, `body`, `identifier` | string | Natural key (unique index) |
+| `title`, `description`, `published_date`, `partition_date`, `doc_url` | — | Carried from the curated record |
 | `complainant` / `respondent` | string? | Split from the listing description ("A v B") |
 | `adjudication_officer` | string? | From the labelled "Adjudication Officer:" line |
 | `hearing_date` | string (ISO)? | From "Date of (Adjudication) Hearing:" |
@@ -152,30 +157,67 @@ scans get `"binary_source"` (would need OCR) so coverage stays measurable.
 | `outcome` | string? | upheld \| not_upheld \| mixed — deterministic phrase rules, never a guess |
 | `self_represented` | bool | "Self-Represented" appears in the decision |
 | `is_anonymised` | bool | Generic party descriptors ("A Worker v A Hotel") |
+| `paragraphs` | string[] | Decision body split into block-level paragraphs (scripts/styles removed, whitespace normalised) — the analysis-ready text every other field is extracted from |
+| `paragraph_count` / `text_length` | int | Size of the extracted text (coverage/quality signal; `0` for binary sources) |
 | `extraction_status` | string | `extracted` \| `binary_source` |
 | `source_file_path` / `source_file_hash` | string | Lineage to the exact curated artifact |
 | `extraction_version` | string | Bump re-extracts without touching curated/landing |
 | `run_id` / `enriched_at` | string / datetime | Enrichment run provenance |
 
+**Indexes**
+
+| Index | Type | Purpose |
+|-------|------|---------|
+| `(source, body, identifier)` | **unique** | One enriched record per document |
+| `(partition_date)` | plain | Date-range queries |
+| `(acts_cited)`, `(practice_areas)` | plain (multikey) | Filter case law by statute / practice area |
+| `(adjudication_officer)` | plain | Per-officer analytics |
+| `(cited_decisions)` | plain (multikey) | Reverse citation lookup ("who cites this decision?") |
+| `(outcome)` | plain | Success-rate aggregations |
+
 ---
 
 ## `run_logs` — run summaries (Requirement 10)
 
-Append-only. One document per crawl, mirroring the end-of-run JSON summary.
+Append-only. One document per crawl, mirroring the end-of-run JSON summary
+(`wrc_spider.py:_build_summary()`).
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `run_id` | string | Correlates with `*_run_id` on records and every JSON log line of the run |
-| `spider`, `reason` | string | Spider name and close reason |
-| `start_date`, `end_date`, `partition_size` | — | Run parameters |
-| `partitions` | array | Per `(partition, body)`: `records_found`, `records_scraped`, `records_unchanged`, `records_failed`, `failures[]` (url, identifier, error, http status), listing failures, reconciliation flags |
-| `totals` | object | `found`, `scraped`, `unchanged`, `failed`, listing failures, reconciled/complete partition counts |
+| `spider`, `reason` | string | Spider name and Scrapy close reason (`finished`, `shutdown`, …) |
+| `start_date`, `end_date`, `partition_size` | string | Run parameters |
+| `partitions` | array | One entry per `(partition, body)` — see breakdown below |
+| `totals` | object | Run-wide sums: `found`, `scraped`, `unchanged`, `failed`, `parse_failed`, `skipped`, `unaccounted`, `listing_failures`, `records_listing_at_risk`, `reconciled_partitions`, `complete_partitions` |
 | `finished_at` | string (ISO) | Run completion time |
 
-**Reconciliation invariant:** for each `(partition, body)`,
-`records_found == records_scraped + records_failed + listing_at_risk`, where
-`records_unchanged` is the subset of `records_scraped` whose content matched a
-previous run.
+Each `partitions[]` entry:
+
+| Field | Description |
+|-------|-------------|
+| `partition`, `body` | The `(partition, body)` unit being reconciled |
+| `records_found` | Result count the site reported for this search |
+| `records_scraped` | Fully persisted (metadata + object) — success is counted only after the last pipeline stage |
+| `records_unchanged` | Subset of `records_scraped` whose content matched a previous run (no re-store) |
+| `records_failed` / `failures[]` | Download/validation/pipeline failures — each with `url`, `identifier`, `status`, `stage`, `error` (+ `error_type` for pipeline errors) |
+| `records_parse_failed` / `parse_failures[]` | Listing cards missing identifier/link — recorded, never silently dropped |
+| `records_skipped` | Fast-mode (`SKIP_EXISTING_IDENTIFIERS`) skips |
+| `docs_enqueued` | Document requests actually enqueued |
+| `records_unaccounted` | Enqueued requests that never reached a terminal state (silent loss — surfaced, never hidden) |
+| `listing_failures[]` / `records_listing_at_risk` | Failed listing pages (`url`, `page`, `status`, `error`, `records_at_risk`) and the records they would have yielded |
+| `count_parse_failed` | Result-count banner could not be parsed (found is then unknown) |
+| `records_accounted`, `reconciled`, `complete` | The invariant check below, its verdict, and whether the partition also had zero failures |
+
+**Reconciliation invariant** — every found record lands in exactly one bucket;
+for each `(partition, body)`:
+
+```
+records_found == records_scraped + records_failed + records_parse_failed
+               + records_skipped + records_listing_at_risk + records_unaccounted
+```
+
+`reconciled` is true when that equation holds; `complete` additionally
+requires zero failures of any kind.
 
 **Indexes**
 

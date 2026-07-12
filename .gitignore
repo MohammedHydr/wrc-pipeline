@@ -1,10 +1,3 @@
-.venv*
-__pycache__/
-*.pyc
-.env
-scraper/httpcache/
-.pytest_cache/
-airflow_home/
 # Environment variables and secrets
 .env
 .env.*
@@ -20,9 +13,7 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
-
-# uv virtual environment
-.venv/
+.venv*/
 
 # Local data and storage
 data/
@@ -30,14 +21,14 @@ storage/
 downloads/
 mongo-data/
 minio-data/
+scraper/httpcache/
 
 # Logs
 *.log
 logs/
 
-# Playwright
-playwright-report/
-test-results/
+# Orchestrator state
+.dagster_home
 
 # IDE and operating system
 .vscode/
@@ -46,9 +37,6 @@ test-results/
 Thumbs.db
 
 # Claude local/private configuration
-.claude/settings.local.json
 .claude/
 CLAUDE.md
 .tmp*
-.dagster_home
-docs/

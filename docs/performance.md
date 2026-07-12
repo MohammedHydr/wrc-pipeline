@@ -22,7 +22,7 @@ per-request overhead** — not micro-optimizing the HTML parser (which is alread
 |---|--------|-------|--------|
 | 1 | Strip-tags removal in **one** DOM traversal instead of one walk per tag (`find_all(list(STRIP_TAGS))`) | `config/html_utils.py` | ~12× fewer tree walks in `_remove_tags`; byte-identical output |
 | 2 | Scraper skips HTML serialization it never uses (`need_html=False`) | `config/html_utils.py`, `scraper/wrc_scraper/pipelines.py` | Skips attribute cleaning, text-node rewrite, serialize + encode on **every** HTML doc crawled; only `content_bytes` (the change-detection hash input) is produced |
-| 3 | Transform parallelized across records with a bounded thread pool | `transform/transform.py`, `TRANSFORM_WORKERS` | Overlaps S3/Mongo latency — the single biggest wall-clock win; idempotent regardless of completion order |
+| 3 | Transform and enrichment parallelized across records with a bounded thread pool | `transform/transform.py`, `transform/enrich.py`, `TRANSFORM_WORKERS` | Overlaps S3/Mongo latency — the single biggest wall-clock win; idempotent regardless of completion order |
 | 4 | Cookie middleware disabled (`COOKIES_ENABLED=false`) | `scraper/wrc_scraper/settings.py` | Flow is stateless GET (recon-confirmed); removes per-request cookie overhead and avoids volatile tracking cookies |
 | 5 | Download memory guard (`DOWNLOAD_MAXSIZE` / `DOWNLOAD_WARNSIZE`) | `scraper/wrc_scraper/settings.py` | Bounds memory for buffered document downloads; an oversized response becomes an **auditable failure** via the errback, never a silent loss or OOM |
 | 6 | Conditional re-fetches (`If-None-Match` → 304) | `wrc_spider.py:_load_validators()/_conditional_headers()`, state `latest_etag` | Unchanged known documents cost a header exchange, **zero body bytes** — measured live (PDF w/ ETag → `304, size_download: 0`). Dynamic HTML pages send no validators (`no-cache`), so they re-fetch + hash-compare — provably the only change detection there. Toggle: `USE_CONDITIONAL_REQUESTS` |
@@ -45,7 +45,8 @@ calls the full path (`need_html=True`) to produce curated HTML.
 Mongo/S3 client is shared across workers. Each record upserts its own
 `(source, body, identifier)` key, so completion order never affects the result —
 idempotency is preserved. Worker count is env-driven via `TRANSFORM_WORKERS`
-(default 8); set to `1` for fully sequential execution.
+(default 8); set to `1` for fully sequential execution. The enrichment step
+(`transform/enrich.py`) uses the same pattern and the same setting.
 
 ## Already in place (good practice, no change needed)
 
@@ -138,6 +139,6 @@ These are the right levers when the crawl fans out across **many domains**
 | `COOKIES_ENABLED` | false | Cookie middleware (off — stateless flow) |
 | `DOWNLOAD_MAXSIZE` | 268435456 | Max buffered download (bytes) |
 | `DOWNLOAD_WARNSIZE` | 33554432 | Warn threshold (bytes) |
-| `TRANSFORM_WORKERS` | 8 | Transform thread-pool size |
+| `TRANSFORM_WORKERS` | 8 | Transform/enrichment thread-pool size |
 | `HTTP_CACHE_ENABLED` | false | Dev-only response cache |
 | `SKIP_EXISTING_IDENTIFIERS` | false | Fast incremental mode (skips change detection) |

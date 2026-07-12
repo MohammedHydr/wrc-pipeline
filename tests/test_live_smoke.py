@@ -20,7 +20,7 @@ import pytest
 from parsel import Selector
 
 from config.settings import get_settings
-from scraper.wrc_scraper.spiders.wrc_spider import RESULT_COUNT_RE
+from wrc_scraper.spiders.wrc_spider import RESULT_COUNT_RE
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("WRC_LIVE_SMOKE") != "1",

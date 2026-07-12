@@ -23,8 +23,8 @@ import pytest
 
 from config.common import ensure_bucket, get_mongo_client, get_s3_client
 from config.settings import get_settings
-from scraper.wrc_scraper import pipelines as pl
-from scraper.wrc_scraper.items import WrcDocumentItem
+from wrc_scraper import pipelines as pl
+from wrc_scraper.items import WrcDocumentItem
 
 PDF_V1 = b"%PDF-1.7\noriginal decision text\n%%EOF"
 PDF_V2 = b"%PDF-1.7\namended decision text\n%%EOF"

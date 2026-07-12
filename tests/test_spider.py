@@ -5,9 +5,9 @@ from datetime import date
 
 from scrapy.http import HtmlResponse, Request
 
-from scraper.wrc_scraper.items import WrcDocumentItem
-from scraper.wrc_scraper.spiders import WrcSpider
-from scraper.wrc_scraper.spiders import wrc_spider as wrc_spider_mod
+from wrc_scraper.items import WrcDocumentItem
+from wrc_scraper.spiders import WrcSpider
+from wrc_scraper.spiders import wrc_spider as wrc_spider_mod
 
 # Two result cards + the count line, mirroring the exact live markup observed
 # via `scrapy shell` (li.each-item / span.refNO / h2.title a / span.date /
@@ -439,7 +439,7 @@ def test_parse_document_304_yields_not_modified_item():
 def test_hash_pipeline_resolves_304_item_from_state(monkeypatch):
     from types import SimpleNamespace
 
-    from scraper.wrc_scraper import pipelines as pl
+    from wrc_scraper import pipelines as pl
 
     state_doc = {
         "latest_file_hash": "f" * 64,
