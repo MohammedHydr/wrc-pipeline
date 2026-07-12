@@ -122,10 +122,10 @@ ops:
 ops:
   scrape_landing_zone:
     config:
-      start_date: "2002-03-01"
-      end_date: "2002-03-31"
+      start_date: "2009-07-01"
+      end_date: "2009-07-31"
       partition: "monthly"
-      bodies: "Equality Tribunal,Employment Appeals Tribunal"
+      bodies: "Employment Appeals Tribunal"
 ```
 
 Valid `partition`: `daily` | `weekly` | `monthly`. Valid `bodies` (comma-
