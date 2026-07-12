@@ -76,7 +76,7 @@ container), and a Mongo web UI:
 |---|---|---|
 | MinIO console | http://localhost:9001 | `minioadmin` / `minioadmin` |
 | mongo-express | http://localhost:8081 | `admin` / `admin` |
-| MongoDB (for Compass) | `mongodb://root:example@localhost:27018/` | — |
+| MongoDB (for Compass) | `mongodb://root:example@localhost:27018/wrc?authSource=admin&directConnection=true` | — |
 
 ## 5. Run via Dagster
 
@@ -88,9 +88,14 @@ export DAGSTER_HOME=$PWD/.dagster_home    # optional — persists run history
 dagster dev -m orchestration.wrc_dagster.definitions
 ```
 
-Open **http://localhost:3000** → job **`wrc_pipeline`** → **Launchpad**,
-paste a run config, and launch. Only the first op takes config; the date
-window flows to transform and enrich automatically.
+Open **http://localhost:3000** → job **`wrc_pipeline`**. The job is
+**monthly-partitioned** (grid starts at `DAGSTER_PARTITION_START_DATE`):
+pick a partition in the **Launchpad** and its run config fills in
+automatically, or use **Partitions → Launch backfill** to run a range of
+months — each month becomes its own independently retryable run (one Scrapy
+subprocess per month). For ad-hoc ranges or body filters, paste a run config
+instead (examples below). Only the first op takes config; the date window
+flows to transform and enrich automatically.
 
 **Standard run — one month, all four bodies:**
 
@@ -257,7 +262,8 @@ zero body bytes** re-downloaded.
 docker exec -it wrc-mongo mongosh -u root -p example
 > use wrc
 > db.landing_document_versions.countDocuments()        // identical after rerun
-> db.run_logs.find().sort({finished_at:-1}).limit(1)   // per-run summary: found = succeeded + unchanged + failed
+> db.run_logs.find().sort({finished_at:-1}).limit(1)   // per-run summary: every found record in one terminal bucket, unaccounted = 0
+> db.failed_documents.find({status:"pending"})         // dead-letter ledger; replay = re-run the partition
 ```
 
 ## 9. Logging
@@ -291,6 +297,10 @@ pytest tests/ -q
   against the compose stack in a throwaway DB/bucket, proving the rerun
   contract. Auto-skips when the stack is down.
 - **Live smoke** (opt-in) — `WRC_LIVE_SMOKE=1 pytest tests/test_live_smoke.py`.
+- **CI** (`.github/workflows/ci.yml`) — every push runs
+  `ruff format --check`, `ruff check`, `mypy`, and the full test suite with
+  MongoDB + MinIO up, so the integration idempotency proof runs on every
+  commit. The live-site smoke test stays opt-in and out of CI.
 
 ## 12. Beyond the brief — notable extras
 
@@ -312,9 +322,11 @@ pytest tests/ -q
   unchanged documents cost a header exchange and **zero body bytes**. A
   `SKIP_EXISTING_IDENTIFIERS` toggle adds an even faster incremental mode
   that skips known identifiers entirely.
-- **Run reconciliation as an invariant** — every run must satisfy
-  `found = succeeded + unchanged + failed` per (partition, body); the
-  accounting is persisted to `run_logs`, so missing records can't hide.
+- **Run reconciliation as an invariant** — per (partition, body), every
+  found record must land in exactly one terminal bucket (scraped — with
+  `unchanged` as its subset — failed, parse-failed, skipped, listing-at-risk)
+  and a cell is complete only when `unaccounted = 0`; the accounting is
+  persisted to `run_logs`, so missing records can't hide.
 - **Enrichment layer** — a third pipeline stage extracting structured
   business fields (parties, acts cited, awards, outcomes, citation graph),
   not required by the assessment.

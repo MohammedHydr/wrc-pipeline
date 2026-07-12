@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     # Partitioning: monthly | weekly | daily
     # ------------------------------------------------------------------ #
     partition_size: str = Field(default="monthly")
+    # First month of Dagster's partition/backfill grid.
+    dagster_partition_start_date: str = Field(default="2024-01-01")
 
     # ------------------------------------------------------------------ #
     # Scrapy politeness / anti-blocking
@@ -95,6 +97,9 @@ class Settings(BaseSettings):
     mongo_curated_collection: str = Field(default="curated_documents")
     mongo_enriched_collection: str = Field(default="enriched_decisions")
     mongo_run_log_collection: str = Field(default="run_logs")
+    # Dead-letter ledger: one row per failed record, replayed by re-running
+    # the partition (failed records are never persisted, so they re-fetch).
+    mongo_failed_collection: str = Field(default="failed_documents")
 
     # ------------------------------------------------------------------ #
     # Object storage (MinIO / any S3-compatible endpoint)

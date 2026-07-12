@@ -468,3 +468,178 @@ def test_hash_pipeline_resolves_304_item_from_state(monkeypatch):
     assert out["file_hash"] == "f" * 64
     assert out["file_path"].endswith("/f.pdf")
     assert spider.run_stats[key]["unchanged"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Fallback pagination (count text unparseable -> follow pager next link)
+# --------------------------------------------------------------------------- #
+# One well-formed card, no count text; pager markup mirrors the live site.
+CARDS_NO_COUNT_HTML = """
+<html><body>
+  <ul class="results">
+    <li class="each-item clearfix">
+      <h2 class="title"><a href="/en/cases/2024/february/lcr22912.html">LCR22912</a></h2>
+      <span class="date">30/01/2024</span>
+      <p class="description" title="A v B">A v B</p>
+      <div class="row bottom-ref">
+        <div class="ref"><span class="refNO">LCR22912</span></div>
+        <div class="link"><a href="/en/cases/2024/february/lcr22912.html">View</a></div>
+      </div>
+    </li>
+  </ul>
+  {pager}
+</body></html>
+"""
+
+PAGER_NEXT_TO = (
+    '<ul class="pager"><li class="current"><a href="?decisions=1&body=3'
+    '&pageNumber={current}">{current}</a></li><li><a class="next" '
+    'href="?decisions=1&from=01/01/2024&to=31/01/2024&body=3'
+    '&pageNumber={next}">next</a></li></ul>'
+)
+
+FALLBACK_KEY = ("2024-01-01_2024-01-31", "Labour Court")
+
+
+def _listing_meta(page=1, **overrides):
+    meta = {
+        "body": FALLBACK_KEY[1],
+        "body_code": "3",
+        "partition_date": "2024-01-01",
+        "partition_label": FALLBACK_KEY[0],
+        "win_start": date(2024, 1, 1),
+        "win_end": date(2024, 1, 31),
+        "page": page,
+    }
+    meta.update(overrides)
+    return meta
+
+
+def _listing_response(html: str, meta: dict) -> HtmlResponse:
+    return HtmlResponse(
+        url=SEARCH_URL,
+        body=html.encode("utf-8"),
+        encoding="utf-8",
+        request=Request(SEARCH_URL, meta=meta),
+    )
+
+
+def _split_requests(spider, out):
+    listing = [r for r in out if r.callback == spider.parse_results]
+    docs = [r for r in out if r.callback == spider.parse_document]
+    return listing, docs
+
+
+def test_count_parse_failure_falls_back_to_next_link_pagination():
+    spider = _spider()
+    html = CARDS_NO_COUNT_HTML.format(pager=PAGER_NEXT_TO.format(current=1, next=2))
+    out = list(spider.parse_results(_listing_response(html, _listing_meta())))
+
+    # The failure stays visible: found is unknown, partition flagged.
+    assert spider.run_stats[FALLBACK_KEY]["count_parse_failed"] is True
+    assert spider.run_stats[FALLBACK_KEY]["found"] is None
+
+    listing, docs = _split_requests(spider, out)
+    assert len(docs) == 1  # the visible card is still crawled
+    assert len(listing) == 1  # ...and so is page 2, via the next link
+    assert listing[0].meta["page"] == 2
+    assert listing[0].meta["paginate_by_next"] is True
+    assert "pageNumber=2" in listing[0].url
+
+
+def test_fallback_page_follows_subsequent_next_links():
+    spider = _spider()
+    spider.run_stats[FALLBACK_KEY]["count_parse_failed"] = True
+    html = CARDS_NO_COUNT_HTML.format(pager=PAGER_NEXT_TO.format(current=2, next=3))
+    meta = _listing_meta(page=2, paginate_by_next=True)
+    out = list(spider.parse_results(_listing_response(html, meta)))
+
+    listing, docs = _split_requests(spider, out)
+    assert len(docs) == 1
+    assert len(listing) == 1
+    assert listing[0].meta["page"] == 3
+    assert listing[0].meta["paginate_by_next"] is True
+
+
+def test_fallback_pagination_stops_when_no_next_link():
+    spider = _spider()
+    spider.run_stats[FALLBACK_KEY]["count_parse_failed"] = True
+    html = CARDS_NO_COUNT_HTML.format(pager="")  # last page: no pager next
+    meta = _listing_meta(page=3, paginate_by_next=True)
+    out = list(spider.parse_results(_listing_response(html, meta)))
+
+    listing, docs = _split_requests(spider, out)
+    assert len(docs) == 1
+    assert listing == []
+
+
+def test_fallback_pagination_refuses_non_advancing_next_link():
+    # A next link that does not advance the page must stop the walk (no loop).
+    spider = _spider()
+    spider.run_stats[FALLBACK_KEY]["count_parse_failed"] = True
+    html = CARDS_NO_COUNT_HTML.format(pager=PAGER_NEXT_TO.format(current=2, next=2))
+    meta = _listing_meta(page=2, paginate_by_next=True)
+    out = list(spider.parse_results(_listing_response(html, meta)))
+
+    listing, _ = _split_requests(spider, out)
+    assert listing == []
+
+
+def test_parsed_count_uses_numeric_fanout_not_next_link():
+    # When the total parses, pagination stays numeric; the next link is ignored.
+    spider = _spider()
+    html = RESULTS_HTML.replace(
+        "</body>", PAGER_NEXT_TO.format(current=1, next=2) + "</body>"
+    )
+    out = list(spider.parse_results(_listing_response(html, _listing_meta())))
+
+    listing, docs = _split_requests(spider, out)
+    assert len(docs) == 2
+    # 45 results at 10/page -> pages 2..5, each exactly once.
+    assert sorted(r.meta["page"] for r in listing) == [2, 3, 4, 5]
+    assert all("paginate_by_next" not in r.meta for r in listing)
+
+
+# --------------------------------------------------------------------------- #
+# Dead-letter ledger (failed_documents)
+# --------------------------------------------------------------------------- #
+def test_ledger_rows_flatten_document_and_parse_failures():
+    p = _summary_for(
+        found=3,
+        scraped=1,
+        docs_enqueued=2,
+        failed=[
+            {
+                "url": "http://x/d.pdf",
+                "identifier": "ADJ-1",
+                "status": 504,
+                "error": "timeout",
+            }
+        ],
+        parse_failures=[
+            {
+                "url": "http://x/list",
+                "identifier": None,
+                "stage": "listing_parse",
+                "error": "result card missing identifier or link",
+            }
+        ],
+    )
+    rows = wrc_spider_mod._ledger_rows(p, "run-42")
+
+    assert len(rows) == 2
+    doc_row, parse_row = rows
+    assert doc_row["url"] == "http://x/d.pdf"
+    assert doc_row["identifier"] == "ADJ-1"
+    assert doc_row["stage"] == "document"  # download failures carry no stage
+    assert doc_row["http_status"] == 504
+    assert doc_row["partition_label"] == "2022-04-01_2022-04-30"
+    assert doc_row["body"] == "Workplace Relations Commission"
+    assert doc_row["last_run_id"] == "run-42"
+    assert parse_row["stage"] == "listing_parse"
+    assert parse_row["identifier"] is None
+
+
+def test_ledger_rows_empty_for_clean_partition():
+    p = _summary_for(found=2, scraped=2, docs_enqueued=2)
+    assert wrc_spider_mod._ledger_rows(p, "run-42") == []

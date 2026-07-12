@@ -16,7 +16,7 @@ import math
 import re
 from collections import defaultdict
 from datetime import date, datetime, timezone
-from typing import AsyncIterator, Dict, List, Optional, Tuple
+from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import scrapy
@@ -40,6 +40,7 @@ DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
 RESULT_COUNT_RE = re.compile(
     r"Shows?\s+\d+\s+to\s+\d+\s+of\s+([\d,]+)\s+results", re.IGNORECASE
 )
+NEXT_PAGE_RE = re.compile(r"[?&]pageNumber=(\d+)", re.IGNORECASE)
 
 
 class WrcSpider(scrapy.Spider):
@@ -270,13 +271,14 @@ class WrcSpider(scrapy.Spider):
                 )
 
             elif total is None:
-                # Cards exist but the count didn't parse — a real problem
-                # that must not masquerade as zero.
+                # Cards exist but the count didn't parse: flag it (never a
+                # silent zero) and let next-link pagination take over.
                 self.run_stats[key]["found"] = None
                 self.run_stats[key]["count_parse_failed"] = True
 
                 self.logger.error(
-                    "could not parse total result count",
+                    "could not parse total result count; "
+                    "falling back to next-link pagination",
                     extra={
                         "partition": meta["partition_label"],
                         "body": meta["body"],
@@ -381,6 +383,59 @@ class WrcSpider(scrapy.Spider):
                 meta=doc_meta,
                 dont_filter=False,
             )
+
+        # Total unknown → walk the pager's next link instead of stopping here.
+        if meta.get("paginate_by_next") or self.run_stats[key]["count_parse_failed"]:
+            yield from self._follow_next_page(response, meta)
+
+    def _follow_next_page(
+        self, response: Response, meta: Dict
+    ) -> Iterator[scrapy.Request]:
+        """Fallback pagination when the result total failed to parse: follow
+        `ul.pager a.next` (loop-guarded) so pages 2+ are still crawled; the
+        partition stays flagged count_parse_failed."""
+        current_page = int(meta.get("page") or 1)
+        href = response.css("ul.pager a.next::attr(href)").get()
+
+        if not href:
+            self.logger.info(
+                "fallback pagination exhausted (no next link)",
+                extra={"page": current_page, **_ctx(meta)},
+            )
+            return
+
+        match = NEXT_PAGE_RE.search(href)
+        next_page = int(match.group(1)) if match else None
+
+        if next_page is None or next_page <= current_page:
+            self.logger.error(
+                "next link does not advance the page; stopping fallback "
+                "pagination to avoid a loop",
+                extra={"href": href, "page": current_page, **_ctx(meta)},
+            )
+            return
+
+        self.logger.info(
+            "following next-page link (count-parse fallback)",
+            extra={"page": next_page, **_ctx(meta)},
+        )
+
+        yield scrapy.Request(
+            urljoin(response.url, href),
+            callback=self.parse_results,
+            errback=self.on_request_failed,
+            dont_filter=True,
+            meta={
+                "body": meta["body"],
+                "body_code": meta.get("body_code"),
+                "partition_date": meta["partition_date"],
+                "partition_label": meta["partition_label"],
+                "win_start": meta.get("win_start"),
+                "win_end": meta.get("win_end"),
+                "page": next_page,
+                "paginate_by_next": True,
+            },
+        )
 
     def _extract_total(self, response: Response) -> Optional[int]:
         """Parse "Shows 1 to 10 of N results" into N (None if not found)."""
@@ -956,6 +1011,8 @@ class WrcSpider(scrapy.Spider):
 
             run_logs.insert_one(json.loads(json.dumps(summary)))
 
+            self._persist_failure_ledger(client, summary)
+
             client.close()
 
         except Exception as exc:  # noqa: BLE001
@@ -964,10 +1021,79 @@ class WrcSpider(scrapy.Spider):
                 extra={"error": str(exc)},
             )
 
+    def _persist_failure_ledger(self, client, summary: Dict) -> None:
+        """Dead-letter ledger (`failed_documents`): upsert this run's failures
+        with an incrementing retry_count; rows a re-run no longer reproduces
+        flip to resolved. Replay = re-run the partition (failed records were
+        never persisted, so they are re-fetched by construction)."""
+        coll = client[self.cfg.mongo_db][self.cfg.mongo_failed_collection]
+        coll.create_index(
+            [("url", 1), ("identifier", 1), ("partition_label", 1), ("body", 1)],
+            unique=True,
+            name="uq_failed_document",
+        )
+        coll.create_index(
+            [("status", 1), ("partition_label", 1)],
+            name="failed_status_partition_1",
+        )
+
+        now = datetime.now(timezone.utc)
+        for part in summary["partitions"]:
+            # Only a fully-listed partition re-attempted every record, so only
+            # then may its still-pending rows be considered resolved.
+            if not part["listing_failures"]:
+                coll.update_many(
+                    {
+                        "partition_label": part["partition"],
+                        "body": part["body"],
+                        "status": "pending",
+                    },
+                    {
+                        "$set": {
+                            "status": "resolved",
+                            "resolved_at": now,
+                            "resolved_run_id": self.run_id,
+                        }
+                    },
+                )
+            for row in _ledger_rows(part, self.run_id):
+                key = {
+                    f: row[f] for f in ("url", "identifier", "partition_label", "body")
+                }
+                coll.update_one(
+                    key,
+                    {
+                        "$set": {**row, "status": "pending", "last_seen_at": now},
+                        "$inc": {"retry_count": 1},
+                        "$setOnInsert": {"first_seen_at": now},
+                    },
+                    upsert=True,
+                )
+
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def _ledger_rows(partition_summary: Dict, run_id: str) -> List[Dict]:
+    """One dead-letter row per document/parse failure in a partition summary."""
+    rows = []
+    for field in ("failures", "parse_failures"):
+        for failure in partition_summary[field]:
+            rows.append(
+                {
+                    "url": failure.get("url"),
+                    "identifier": failure.get("identifier"),
+                    "partition_label": partition_summary["partition"],
+                    "body": partition_summary["body"],
+                    "stage": failure.get("stage", "document"),
+                    "error": failure.get("error"),
+                    "http_status": failure.get("status"),
+                    "last_run_id": run_id,
+                }
+            )
+    return rows
+
+
 def _url_extension(url: str) -> Optional[str]:
     path = urlparse(url).path.lower()
     for ext in BINARY_EXTENSIONS:

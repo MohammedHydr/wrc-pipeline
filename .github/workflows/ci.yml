@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: ruff format (check)
+        run: ruff format --check .
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: mypy
+        run: mypy config scraper transform orchestration
+
+      # MongoDB + MinIO so tests/test_integration_idempotency.py runs for
+      # real instead of skipping. The live-site smoke test stays opt-in
+      # (WRC_LIVE_SMOKE=1) and is deliberately NOT enabled here.
+      - name: Start MongoDB + MinIO
+        run: |
+          cp .env.example .env
+          docker compose up -d --wait mongo minio
+
+      - name: pytest (unit + integration)
+        run: pytest -v
+
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v

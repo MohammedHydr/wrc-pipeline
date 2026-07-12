@@ -46,6 +46,13 @@ Enforcement / Industrial Relations Referral) — left unset.
 `Shows 1 to 10 of <N> results` → parsed by `RESULT_COUNT_RE`. The spider
 computes `ceil(N / 10)` pages and fans out `pageNumber=2..pages`.
 
+**Fallback**: if the count text ever fails to parse (site copy change),
+numeric fan-out is impossible — the spider degrades to following the pager's
+next link (`<ul class="pager"> … <a class="next">`, verified live), so pages
+2+ are still crawled. The partition is flagged `count_parse_failed` in the
+run summary (found is unknown), so the degradation is visible, never silent.
+A next link that does not advance `pageNumber` stops the walk (loop guard).
+
 ## Result card structure
 
 Each result is a `<li class="each-item">`:

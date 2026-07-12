@@ -1,17 +1,19 @@
 """Dagster orchestration: scrape_landing_zone >> transform_to_curated >>
-enrich_decisions, plus a monthly schedule (`wrc_monthly_incremental`) that
-turns the backfill into a living feed. Mongo/MinIO come from docker compose;
-Dagster, Scrapy and the transforms run natively."""
+enrich_decisions as one monthly-partitioned job — backfill any range of
+months from the UI, each month its own independently retryable run — plus a
+schedule (`wrc_monthly_incremental`) that materializes the previous month's
+partition. Mongo/MinIO come from docker compose; the rest runs natively."""
 
 import os
 import subprocess
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import dagster as dg
 
 from config.common import parse_cli_date
+from config.settings import get_settings
 from transform.enrich import run_enrichment
 from transform.transform import run_transformation
 
@@ -53,6 +55,25 @@ def _validate_config(config: WrcPipelineConfig) -> None:
                 f"Expected one of {sorted(allowed_partitions)}."
             )
         )
+
+
+# Monthly partition grid: one (month → run) cell per calendar month, giving
+# Dagster-native backfills, per-month retries, and one subprocess per month.
+@dg.monthly_partitioned_config(start_date=get_settings().dagster_partition_start_date)
+def wrc_monthly_config(start: datetime, end: datetime) -> dict:
+    """Map one monthly partition to run config (Dagster's `end` is exclusive)."""
+    return {
+        "ops": {
+            "scrape_landing_zone": {
+                "config": {
+                    "start_date": start.date().isoformat(),
+                    "end_date": (end - timedelta(days=1)).date().isoformat(),
+                    "partition": "monthly",
+                    "bodies": "",
+                }
+            }
+        }
+    }
 
 
 def _subprocess_environment() -> dict[str, str]:
@@ -267,19 +288,28 @@ def enrich_decisions(
     )
 
     if failures:
-        raise dg.Failure(
-            description=(f"{len(failures)} enrichment record(s) failed: {failures}")
+        # Enrichment is an optional business-layer bonus, not part of the
+        # required assignment pipeline (which ends at curated). A failure
+        # here is surfaced loudly but must not fail the overall run.
+        context.log.error(
+            "%s enrichment record(s) failed (non-fatal, pipeline requirement "
+            "ends at curated): %s",
+            len(failures),
+            failures,
         )
 
     return stats
 
 
 @dg.job(
+    config=wrc_monthly_config,
     description=(
         "Scrape WRC decisions into the immutable landing zone, transform "
         "their latest versions into the curated zone, then extract "
-        "structured business fields into the enriched collection."
-    )
+        "structured business fields into the enriched collection. "
+        "Monthly-partitioned: backfill any range of months from the UI, "
+        "each month as its own independently retryable run."
+    ),
 )
 def wrc_pipeline():
     enrich_decisions(transform_to_curated(scrape_landing_zone()))
@@ -293,26 +323,14 @@ def wrc_pipeline():
 def wrc_monthly_incremental(
     context: dg.ScheduleEvaluationContext,
 ) -> dg.RunRequest:
-    """Scrape/transform/enrich the previous calendar month. Idempotency makes
+    """Materialize the previous calendar month's partition. Idempotency makes
     the recurring rerun safe: known records are observed, never duplicated."""
     today = context.scheduled_execution_time.date()
-    prev_end = today.replace(day=1) - timedelta(days=1)
-    prev_start = prev_end.replace(day=1)
+    prev_start = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
 
-    return dg.RunRequest(
-        run_config={
-            "ops": {
-                "scrape_landing_zone": {
-                    "config": {
-                        "start_date": prev_start.isoformat(),
-                        "end_date": prev_end.isoformat(),
-                        "partition": "monthly",
-                        "bodies": "",
-                    }
-                }
-            }
-        }
-    )
+    # partition_key resolves run config via wrc_monthly_config and marks the
+    # cell materialized in the partition grid.
+    return dg.RunRequest(partition_key=prev_start.isoformat())
 
 
 defs = dg.Definitions(
