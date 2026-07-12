@@ -46,7 +46,7 @@ files renamed to `identifier.ext`).
 ## 2. Install
 
 ```bash
-git clone <this-repo> && cd wrc-pipeline
+git clone https://github.com/MohammedHydr/wrc-pipeline.git && cd wrc-pipeline
 
 python -m venv .venv
 source .venv/bin/activate        # Windows PowerShell: .venv\Scripts\Activate.ps1
